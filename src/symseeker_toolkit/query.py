@@ -79,17 +79,16 @@ def build_criterion_query(attribute, value, operator="exact_match"):
                 comparison operator (e.g. "contains_phrase", "greater")
 
     For operator="range", this builds two combined sub-queries
-    (>= low AND <= high) rather than relying on a single "range" operator —
+    (>= low AND <= high) rather than relying on a single "range" operator
     this is the safest approach until we've confirmed rcsb.api's exact range
     syntax against a live call (see the TODO at the bottom of this file).
     """
     path = ATTRIBUTE_REGISTRY.get(attribute, attribute)
+    attr = Attr(path)
 
     if operator == "range":
         low, high = value
-        q_low = AttributeQuery(attribute=path, operator="greater_or_equal", value=low)
-        q_high = AttributeQuery(attribute=path, operator="less_or_equal", value=high)
-        return q_low & q_high
+        return (attr >= low) & (attr <= high)
 
     return AttributeQuery(attribute=path, operator=operator, value=value)
 
