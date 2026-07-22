@@ -13,6 +13,7 @@ NiceGUI form later) can drive the same logic.
 from functools import reduce
 import pandas as pd
 from rcsbapi.search import AttributeQuery
+from rcsbapi.search import Attr
 from rcsbapi.data import DataQuery
 
 
@@ -48,8 +49,8 @@ ATTRIBUTE_REGISTRY = {
 
     # EXPERIMENTAL & DEPOSITION
     "assembly_method": "pdbx_struct_assembly.method_details",
-    "resolution": "entry.rcsb_entry_info.resolution_combined",
-    "experimental_method": "entry.rcsb_entry_info.experimental_method",
+    "resolution": "rcsb_entry_info.resolution_combined",
+    "experimental_method": "rcsb_entry_info.experimental_method",
     "model_quality": "ma_qa_metric_global.value",
 
     # TEXT QUERIES
@@ -68,30 +69,21 @@ RANGE_HINTED_ATTRIBUTES = {
 }
 
 
+from rcsbapi.search import Attr
+
 def build_criterion_query(attribute, value, operator="exact_match"):
-    """
-    Build a single query from one filter criterion.
-
-    attribute : short name from ATTRIBUTE_REGISTRY, or a raw dotted path
-    value     : a single value for exact/text operators, or a (low, high)
-                tuple when operator="range"
-    operator  : "exact_match" (default), "range", or any other rcsb.api
-                comparison operator (e.g. "contains_phrase", "greater")
-
-    For operator="range", this builds two combined sub-queries
-    (>= low AND <= high) rather than relying on a single "range" operator
-    this is the safest approach until we've confirmed rcsb.api's exact range
-    syntax against a live call (see the TODO at the bottom of this file).
-    """
     path = ATTRIBUTE_REGISTRY.get(attribute, attribute)
-    attr = Attr(path)
+    
+def build_criterion_query(attribute, value, operator="exact_match"):
+    path = ATTRIBUTE_REGISTRY.get(attribute, attribute)
 
     if operator == "range":
         low, high = value
-        return (attr >= low) & (attr <= high)
+        q_low = AttributeQuery(attribute=path, operator="greater_or_equal", value=float(low))
+        q_high = AttributeQuery(attribute=path, operator="less_or_equal", value=float(high))
+        return q_low & q_high
 
     return AttributeQuery(attribute=path, operator=operator, value=value)
-
 
 def combine_queries(queries, mode="and"):
     """
