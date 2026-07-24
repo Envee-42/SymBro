@@ -8,28 +8,32 @@ memorable field names instead of raw dotted attribute paths, arbitrary
 AND/OR combination of any attributes, and range support for numeric/date
 fields — all as plain functions, so any interface (script, CLI, or a
 NiceGUI form later) can drive the same logic.
+
+IMPORTANT CONTEXT — two backends, two schemas:
+rcsb.org actually runs two separate services behind the `rcsbapi` package:
+  - the Search API   (what AttributeQuery / our `query()` function talks to)
+  - the Data API     (a GraphQL service, what DataQuery talks to)
+These are maintained somewhat independently. A field that conceptually
+means the same thing (e.g. "resolution") can live at a DIFFERENT dotted
+path in each one, because the Data API mirrors the actual object graph
+(assembly -> entry -> resolution) while the Search API flattens everything
+into one flat namespace for convenience. This is why we now keep TWO
+registries below instead of one shared dict.
 """
 
 from functools import reduce
 import pandas as pd
 from rcsbapi.search import AttributeQuery
-from rcsbapi.search import Attr
 from rcsbapi.data import DataQuery
 
 
-# --------------------------------------------------------------------------
-# Attribute registry: short name -> full rcsb.api dotted path.
-#
-# A user picks filters by short name here, or passes a raw dotted path
-# directly for anything not yet registered. Extend freely.
-#
-# NOTE on "keywords": rcsb.api's actual field name is very likely
-# `struct_keywords.pdbx_keywords` (underscore) rather than the colon
-# version below — the colon looks like it may be a typo. Worth confirming
-# against the schema before relying on that one field; left as given for
-# now so nothing silently changes underneath you.
-# --------------------------------------------------------------------------
-ATTRIBUTE_REGISTRY = {
+# ============================================================================
+# SEARCH_ATTRIBUTES — short name -> Search API dotted path.
+# This is what AttributeQuery (used inside query()) needs, and it's what
+# search_ids() / search_by_criteria() ultimately query against.
+# ============================================================================
+
+SEARCH_ATTRIBUTES = {
     # HIERARCHY & SYMMETRY
     "symmetry": "rcsb_struct_symmetry.symbol",
     "oligomeric_count": "pdbx_struct_assembly.oligomeric_count",
@@ -39,58 +43,100 @@ ATTRIBUTE_REGISTRY = {
     "polymer_entity_count": "rcsb_assembly_info.polymer_entity_count",
     "composition": "rcsb_assembly_info.polymer_composition",
     "weight": "rcsb_assembly_info.molecular_weight",
-    "interface_area": "rcsb_interface_info.interface_area",
 
     # PROTEIN DESIGN & ORIGIN
     "source_organism": "rcsb_entity_source_organism.scientific_name",
-    "source_type": "rcsb_entity_source_organism.type",
     "polymer_entity_type": "rcsb_entry_info.selected_polymer_entity_types",
-    "interface_count": "rcsb_interface_info.interface_count",
 
     # EXPERIMENTAL & DEPOSITION
     "assembly_method": "pdbx_struct_assembly.method_details",
     "resolution": "rcsb_entry_info.resolution_combined",
     "experimental_method": "rcsb_entry_info.experimental_method",
-    "model_quality": "ma_qa_metric_global.value",
 
     # TEXT QUERIES
-    "keywords": "struct_keywords.pdbx:keywords",
+    "keywords": "struct_keywords.pdbx_keywords",
     "title": "struct.title",
     "date": "rcsb_accession_info.deposit_date",
     "pfam_id": "rcsb_polymer_entity_annotation.annotation_id",
 }
 
-# Attributes for which range ("from X to Y") search generally makes more
-# sense than exact match. Not enforced anywhere — purely a hint you can use
-# when building a UI, so range-appropriate fields default to a range widget.
+
+# ============================================================================
+# DATA_ATTRIBUTES — short name -> Data API dotted path.
+# This is what DataQuery (used inside fetch_metadata) needs.
+#
+# Strategy: start as an exact copy of SEARCH_ATTRIBUTES (our default
+# assumption is "same path unless proven otherwise"), then explicitly
+# override any field we've confirmed differs. This keeps one single source
+# of truth (SEARCH_ATTRIBUTES) instead of two dicts drifting out of sync,
+# and makes every deviation visible and explained below rather than buried.
+# ============================================================================
+DATA_ATTRIBUTES = dict(SEARCH_ATTRIBUTES)
+
+# --- CONFIRMED mismatches (verified by hand-testing) -----------------------
+
+DATA_ATTRIBUTES["resolution"] = "entry.rcsb_entry_info.resolution_combined"
+DATA_ATTRIBUTES["weight"] = "entry.rcsb_entry_info.molecular_weight"
+DATA_ATTRIBUTES["source_organism"] =  "entry.polymer_entities.rcsb_entity_source_organism.ncbi_scientific_name"
+DATA_ATTRIBUTES["polymer_entity_type"] = "entry.rcsb_entry_info.selected_polymer_entity_types"
+DATA_ATTRIBUTES["experimental_method"] = "entry.rcsb_entry_info.experimental_method"
+DATA_ATTRIBUTES["model_quality"] = "entry.rcsb_ma_qa_metric_global.ma_qa_metric_global.value"
+DATA_ATTRIBUTES["keywords"] = "entry.struct_keywords.pdbx_keywords"
+DATA_ATTRIBUTES["title"] = "entry.struct.title"
+DATA_ATTRIBUTES["date"] = "entry.rcsb_accession_info.deposit_date"
+DATA_ATTRIBUTES["pfam_id"] = "entry.polymer_entities.rcsb_polymer_entity_annotation.annotation_id"
+
+# --- SUSPECTED mismatches, NOT yet confirmed --------------------------------
+# Left as-is (unprefixed) until tested — flip
+# these on once confirmed, following the resolution example above:
+#
+# DATA_ATTRIBUTES["experimental_method"] = "entry." + SEARCH_ATTRIBUTES["experimental_method"]
+# DATA_ATTRIBUTES["date"] = "entry." + SEARCH_ATTRIBUTES["date"]
+#
+# Everything else (symmetry, stoichiometry, weight, interface_area, etc.)
+# is genuinely assembly/interface-level data, so we'd *expect* those to
+# already match between the two APIs without needing a prefix — but that's
+# still an assumption, not a confirmed fact, until each one is actually
+# exercised through fetch_metadata().
+
+
+# Fields for which a range ("from X to Y") search generally makes more sense than an exact match
 RANGE_HINTED_ATTRIBUTES = {
     "weight", "interface_area", "resolution", "interface_count",
     "oligomeric_count", "polymer_entity_count", "model_quality", "date",
 }
 
 
-from rcsbapi.search import Attr
+def query(attribute, value, operator="exact_match"):
+    """
+    Build a single Search API query object from one filter criterion.
 
-def build_criterion_query(attribute, value, operator="exact_match"):
-    path = ATTRIBUTE_REGISTRY.get(attribute, attribute)
-    
-def build_criterion_query(attribute, value, operator="exact_match"):
-    path = ATTRIBUTE_REGISTRY.get(attribute, attribute)
+    attribute : short name from SEARCH_ATTRIBUTES, or a raw dotted path if you need something not yet registered
+    value     : a single value for exact/text operators, or a (low, high) tuple when operator="range"
+    operator  : "exact_match" (default), "range", or any other rcsb.api comparison operator (e.g. "contains_phrase", "greater")
+
+    For operator="range", this builds two combined sub-queries
+    (>= low AND <= high) using rcsb.api's overloaded `&` operator on query
+    objects, rather than relying on a single native "range" operator.
+    """
+    path = SEARCH_ATTRIBUTES.get(attribute, attribute)
 
     if operator == "range":
         low, high = value
-        q_low = AttributeQuery(attribute=path, operator="greater_or_equal", value=float(low))
-        q_high = AttributeQuery(attribute=path, operator="less_or_equal", value=float(high))
+        q_low = AttributeQuery(attribute=path, operator="greater_or_equal", value=low)
+        q_high = AttributeQuery(attribute=path, operator="less_or_equal", value=high)
         return q_low & q_high
 
     return AttributeQuery(attribute=path, operator=operator, value=value)
 
+
 def combine_queries(queries, mode="and"):
     """
-    Combine several query objects into one.
+    Combine several query() objects into one.
 
-    mode="and" -> matches all of the queries
-    mode="or"  -> matches any of the queries
+    mode="and" -> matches all of the queries (rcsb.api's `&` operator)
+    mode="or"  -> matches any of the queries (rcsb.api's `|` operator)
+
     """
     if mode not in ("and", "or"):
         raise ValueError("mode must be 'and' or 'or'")
@@ -98,42 +144,48 @@ def combine_queries(queries, mode="and"):
     return reduce(op, queries)
 
 
-def search_ids(query, return_type="assembly"):
+def search_ids(query_obj, return_type="assembly"):
     """Execute a query (single or combined) and return the list of matching IDs."""
-    return list(query(return_type=return_type))
+    return list(query_obj(return_type=return_type))
 
 
 def search_by_criteria(criteria, mode="and", return_type="assembly"):
     """
-    General-purpose search: any number of filters, any mix of exact-match
-    and range criteria, combined with AND or OR.
+    General-purpose, DATA-DRIVEN search: any number of filters, any mix of
+    exact-match and range criteria, combined with AND or OR — all described
+    as plain data (a list of dicts) rather than Python code.
+
+    Why this exists alongside query()/combine_queries()/search_ids(): those
+    three are the low-level building blocks, meant for you to call directly
+    in a notebook when you already know exactly what you want. This function
+    exists for anything that PRODUCES a search as data instead of code — the
+    main example being a future NiceGUI form, where a user ticks boxes and
+    fills in ranges, and the UI code just assembles a `criteria` list from
+    those widgets and hands it straight to this one function. No query-
+    building logic needs to live inside the UI code that way.
 
     criteria : list of dicts, each shaped like one of:
         {"attribute": "symmetry", "value": "T"}
         {"attribute": "resolution", "value": (0, 2.5), "operator": "range"}
         {"attribute": "keywords", "value": "nanocage", "operator": "contains_phrase"}
     mode     : "and" or "or" — applies across ALL criteria in the list.
-               (No mixed AND/OR groups yet — a nested-group version can be
-               added later if you need e.g. (A OR B) AND C; flag it if so.)
-
-    Example — symmetry T or O, resolution under 2.5A, natural source only:
-        search_by_criteria([
-            {"attribute": "symmetry", "value": "T"},
-            {"attribute": "symmetry", "value": "O"},
-        ], mode="or")
+               (No mixed AND/OR groups yet — e.g. (A OR B) AND C would need
+               a nested-group version; flag it if you need that later.)
     """
     if not criteria:
         raise ValueError("must supply at least one criterion")
 
-    queries = [build_criterion_query(**c) for c in criteria]
+    queries = [query(**c) for c in criteria]
     combined = combine_queries(queries, mode=mode) if len(queries) > 1 else queries[0]
     return search_ids(combined, return_type=return_type)
 
 
 def search_by_symmetry(symbols, return_type="assembly"):
     """
-    Convenience wrapper over search_by_criteria for the common case:
-    search by one or more symmetry symbols, combined with OR.
+    Convenience shortcut over search_by_criteria for the common case:
+    search by one or more symmetry symbols, combined with OR. Kept mainly
+    for quick one-liners in a notebook — feel free to bypass it and call
+    search_by_criteria directly if you'd rather.
 
     symbols : a single symbol ("T") or a list of symbols (["T", "O"])
     """
@@ -142,40 +194,68 @@ def search_by_symmetry(symbols, return_type="assembly"):
     criteria = [{"attribute": "symmetry", "value": s} for s in symbols]
     return search_by_criteria(criteria, mode="or", return_type=return_type)
 
+def extract_leaf_values(val):
+    """
+    Recursively extracts all primitive/leaf values from any nested dict/list structure.
+    Returns a single scalar if 1 item, a joined string or list if multiple, or None/NaN if empty.
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    
+    # If it's already a clean primitive value, keep it
+    if isinstance(val, (str, int, float, bool)):
+        return val
+
+    leaves = []
+    
+    def _walk(node):
+        if isinstance(node, dict):
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+        elif node is not None:
+            leaves.append(node)
+
+    _walk(val)
+    
+    # Deduplicate while preserving order
+    unique_leaves = list(dict.fromkeys(leaves))
+    
+    if not unique_leaves:
+        return None
+    if len(unique_leaves) == 1:
+        return unique_leaves[0]  # Return as a clean single scalar ("Homo sapiens", 1024.5)
+    
+    # Return string-joined if all are strings, else return as a clean primitive list
+    if all(isinstance(x, str) for x in unique_leaves):
+        return ", ".join(unique_leaves)
+    
+    return unique_leaves
 
 def fetch_metadata(ids, fields, input_type="assembly"):
-    """
-    Fetch metadata attributes for a list of IDs and return them as a DataFrame.
+    
+    paths = [DATA_ATTRIBUTES.get(f, f) for f in fields]
 
-    fields : list of short names (from ATTRIBUTE_REGISTRY) or raw dotted paths.
-             DataFrame columns are named using the short name where available,
-             otherwise the raw path as given.
+    data_query = DataQuery(input_type=input_type, input_ids=ids, return_data_list=paths)
+    raw_results = data_query.exec()
 
-    NOTE: the exact shape of DataQuery's returned JSON needs to be confirmed
-    against a real response before this flattening logic can be trusted —
-    see the TODO at the bottom of this file. Still pending your test run.
-    """
-    paths = [ATTRIBUTE_REGISTRY.get(f, f) for f in fields]
+    # Determine plural key returned by rcsbapi ('assemblies', 'entries', etc.)
+    plural_key = f"{input_type}s" if not input_type.endswith('y') else f"{input_type[:-1]}ies"
 
-    query = DataQuery(input_type=input_type, input_ids=ids, return_data_list=paths)
-    raw_results = query.exec()
+    # Extract the actual list of records from the GraphQL response structure
+    records = raw_results.get("data", {}).get(plural_key, [])
 
-    df = pd.json_normalize(raw_results)
-    path_to_short = {v: k for k, v in ATTRIBUTE_REGISTRY.items()}
+    # Flatten the records — now 1 row per record/assembly!
+    df = pd.json_normalize(records)
+
+    # Rename flat dotted columns back to friendly short names
+    path_to_short = {v: k for k, v in DATA_ATTRIBUTES.items()}
     df = df.rename(columns=lambda c: path_to_short.get(c, c))
-    return df
 
+    clean_df = df.map(extract_leaf_values)
 
-# --------------------------------------------------------------------------
-# TODO (still needs your test run to confirm — carried over from last time):
-# No network access here, so two things are unverified against a real call:
-#   1. fetch_metadata's json_normalize flattening
-#   2. The >= / <= combination used for operator="range" in
-#      build_criterion_query — rcsb.api may have a single native "range"
-#      operator that's cleaner than two combined queries; worth checking
-#      their docs or testing once you can.
-#
-# When you get a chance, run a small real query (2-3 IDs, a couple fields,
-# and one range-based criterion) and paste back what comes out — we'll true
-# up both functions against it.
-# --------------------------------------------------------------------------
+    return clean_df
+
+# TESTING -----------
