@@ -257,7 +257,3 @@ def fetch_metadata(ids, fields, input_type="assembly"):
     clean_df = df.map(extract_leaf_values)
 
     return clean_df
-
-
-
-
