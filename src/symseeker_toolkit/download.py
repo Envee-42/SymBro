@@ -212,7 +212,12 @@ def clear_temp_dir(data_dir=None):
 
     for entry in os.listdir(data_dir):
         entry_path = os.path.join(data_dir, entry)
+        if entry.startswith('.'):
+            continue
+
         if os.path.isfile(entry_path) or os.path.islink(entry_path):
             os.remove(entry_path)
         else:
             shutil.rmtree(entry_path)
+
+# -------- TESTING ----------

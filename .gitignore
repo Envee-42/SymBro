@@ -3,3 +3,4 @@
 .venv/
 __pycache__/
 /symseeker_toolkit/temporary_files/
+__pycache__/

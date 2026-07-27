@@ -258,4 +258,6 @@ def fetch_metadata(ids, fields, input_type="assembly"):
 
     return clean_df
 
-# TESTING -----------
+
+
+
