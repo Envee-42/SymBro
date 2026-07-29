@@ -44,8 +44,11 @@ def parse_assembly_id(assembly_id):
     """
     Splits an RCSB assembly ID (e.g. "6XYZ-1") into its two components:
     entry_id ("6XYZ") and assembly_num ("1"). This is exactly the ID format
-    search_ids() / search_by_criteria() return when return_type="assembly" —
-    a single string combining both pieces of information with a hyphen.
+    search_ids() returns when return_type="assembly", and exactly what
+    fetch_metadata()/query_candidates() name their "assembly_id" column
+    (query.py's Data API fetch always surfaces the record's own rcsb_id
+    under an "<input_type>_id" column — "assembly_id" for the default
+    return_type="assembly").
 
     rsplit("-", 1) splits from the RIGHT, at most once, so this stays
     correct even in the (currently unlikely, but not impossible) case of an
@@ -58,10 +61,10 @@ def parse_assembly_id(assembly_id):
 
 def build_download_table(assembly_ids, data_dir=None):
     """
-    Takes the raw list of assembly ID strings — exactly what
-    search_ids()/search_by_criteria() returns, e.g. ["6XYZ-1", "6XYZ-2", ...] —
-    and builds a DataFrame with everything needed to download each one:
-    assembly_id, entry_id, assembly_num, filepath, and url.
+    Takes the raw list of assembly ID strings — exactly what search_ids()
+    returns, e.g. ["6XYZ-1", "6XYZ-2", ...] — and builds a DataFrame with
+    everything needed to download each one: assembly_id, entry_id,
+    assembly_num, filepath, and url.
 
     This is the piece that was missing before: nothing was actually
     splitting the combined assembly ID into its parts. Call this directly
@@ -89,20 +92,48 @@ def build_download_table(assembly_ids, data_dir=None):
     return pd.DataFrame(rows)
 
 
-def add_download_columns(df, id_column="entry_id", assembly_column="assembly_num", data_dir=None):
+def add_download_columns(df, id_column="entry_id", assembly_column="assembly_num", combined_id_column="assembly_id", data_dir=None):
     """
-    Adds 'filepath' and 'url' columns to a DataFrame that ALREADY has
-    separate entry-ID and assembly-number columns (as opposed to a combined
-    "6XYZ-1"-style ID — for that case, use build_download_table instead).
+    Adds 'filepath' and 'url' columns to a metadata DataFrame — WITHOUT
+    dropping any of its other columns (title, weight, symmetry, whatever
+    else you fetched) — so the result can be handed straight to
+    distance.py's run_ring_analysis() with all of that metadata still
+    attached, rather than having to re-merge it back in by hand afterward.
 
-    Kept around for the case where you're building your download table from
-    something other than a raw search_ids() list — e.g. metadata you
-    assembled by hand with the two fields already split out.
+    Two input shapes are accepted, checked in this order:
+
+      1. df already has separate `id_column`/`assembly_column` columns
+         (e.g. hand-assembled metadata with those two fields already split
+         out) — used directly, exactly as before.
+
+      2. df has a single `combined_id_column` (default "assembly_id" —
+         precisely what query.py's fetch_metadata()/query_candidates()
+         name their ID column when return_type="assembly") holding
+         combined IDs like "6XYZ-1". These get split into `id_column` /
+         `assembly_column` via parse_assembly_id() first, so a
+         query_candidates() result can be passed in here directly with no
+         manual ID-wrangling step in between.
+
+    Raises ValueError if df has neither shape — i.e. no `id_column`/
+    `assembly_column` pair AND no `combined_id_column` to split.
     """
     if data_dir is None:
         data_dir = get_temp_dir()
 
     df = df.copy()  # avoid silently mutating the caller's original DataFrame
+
+    if id_column not in df.columns or assembly_column not in df.columns:
+        if combined_id_column not in df.columns:
+            raise ValueError(
+                f"df must have either '{id_column}'/'{assembly_column}' columns "
+                f"(already-split entry ID + assembly number), or a combined "
+                f"'{combined_id_column}' column (e.g. 'assembly_id', exactly what "
+                f"query.py's fetch_metadata()/query_candidates() produce) to split "
+                f"via parse_assembly_id() — df has neither."
+            )
+        parsed = df[combined_id_column].apply(parse_assembly_id)
+        df[id_column] = parsed.apply(lambda pair: pair[0])
+        df[assembly_column] = parsed.apply(lambda pair: pair[1])
 
     df["filepath"] = df.apply(
         lambda row: os.path.join(
@@ -149,29 +180,43 @@ def download_structure(filepath, url, overwrite=False):
     return filepath
 
 
-def download_candidates(candidates, data_dir=None, id_column="entry_id", assembly_column="assembly_num", overwrite=False):
+def download_candidates(candidates, data_dir=None, id_column="entry_id", assembly_column="assembly_num", combined_id_column="assembly_id", overwrite=False):
     """
     Downloads every candidate structure into temporary_files/ (or a custom
     data_dir), and returns a DataFrame describing what was downloaded.
 
-    candidates : either
+    candidates : any of
         - a plain list of raw assembly ID strings, exactly as returned by
-          search_ids() / search_by_criteria() — e.g. ["6XYZ-1", "6XYZ-2"].
-          This is the common case, right after a search step. Internally
-          this gets split into entry_id/assembly_num via build_download_table.
-        - OR a DataFrame that already has id_column/assembly_column columns
-          separately (handled via add_download_columns instead).
+          search_ids() — e.g. ["6XYZ-1", "6XYZ-2"]. Internally this gets
+          split into entry_id/assembly_num via build_download_table.
+        - a DataFrame straight out of query.py's fetch_metadata() /
+          query_candidates() — i.e. one with a combined "assembly_id"
+          column (or whatever combined_id_column names it) rather than
+          separate entry_id/assembly_num columns. This is the common case
+          once you're filtering candidates by metadata before downloading
+          them: hand the (possibly filter_metadata()-narrowed) DataFrame
+          straight in here, with no manual ID-splitting step in between —
+          every other column it carries (title, weight, symmetry, ...)
+          comes along for the ride in the result too.
+        - a DataFrame that already has id_column/assembly_column columns
+          separately (e.g. hand-built metadata) — handled the same way as
+          before.
+      Both DataFrame shapes are routed through add_download_columns(),
+      which is what actually tells them apart (see its docstring); this
+      function only decides list-vs-DataFrame.
 
-    Returns a DataFrame with assembly_id (if built from a list), entry_id,
-    assembly_num, filepath, and url columns — filepath is what you hand to
-    gemmi or the NC Calculator next.
+    Returns a DataFrame with assembly_id (if built from a list, or however
+    the input DataFrame named it), entry_id, assembly_num, filepath, and
+    url columns, PLUS every other column the input DataFrame already had —
+    filepath is what you hand to gemmi or distance.py next.
     """
     if data_dir is None:
         data_dir = get_temp_dir()
 
     if isinstance(candidates, pd.DataFrame):
         df = add_download_columns(
-            candidates, id_column=id_column, assembly_column=assembly_column, data_dir=data_dir
+            candidates, id_column=id_column, assembly_column=assembly_column,
+            combined_id_column=combined_id_column, data_dir=data_dir,
         )
     else:
         df = build_download_table(candidates, data_dir=data_dir)
@@ -219,5 +264,3 @@ def clear_temp_dir(data_dir=None):
             os.remove(entry_path)
         else:
             shutil.rmtree(entry_path)
-
-# -------- TESTING ----------

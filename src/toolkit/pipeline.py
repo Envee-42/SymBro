@@ -1,31 +1,31 @@
-# -------- TESTING -----------
-from query import query, combine_queries, search_ids, fetch_metadata
-from query import unified_search_and_fetch
-from download import download_candidates, clear_temp_dir
-from geometry.termini import get_chain_ca_geometry
+
+from toolkit.query import build_query, search_ids, fetch_metadata, filter_metadata, query_candidates, DATA_ATTRIBUTES, combine_queries, _resolve_path
+from toolkit.download import download_candidates, clear_temp_dir
 from toolkit.geometry.distance import run_ring_analysis
-from geometry.orientation import annotate_ring_orientation, plot_ring_orientation
-import gemmi
 
-my_criteria = [
-    # 1. Standard API search
-    {"attribute": "symmetry", "value": "T"},
-    
-    # 2. Range API search
-    {"attribute": "weight", "value": (500000, 1000000), "operator": "range"},
-    
-    # 3. Text search
-    {"attribute": "keywords", "value": "nanocage", "operator": "contains_phrase"},
-    
-    # 4. Local-only filter (the orchestrator handles this in Pandas automatically)
-    #    (Assuming model_quality isn't in SEARCH_ATTRIBUTES)
-    {"attribute": "model_quality", "value": (0.8, 1.0), "operator": "range"},
-    
-    # 5. Bring these columns along for the ride, but don't filter by them
-    {"attribute": "source_organism", "operator": "fetch_only"},
-    {"attribute": "date", "operator": "fetch_only"}
-]
+q1 = build_query("symmetry", "T", "exact_match")
+q2 = build_query("symmetry", "O", "exact_match")
 
-dfc = unified_search_and_fetch(criteria=my_criteria)
+#test a nested query by the way
 
-print(dfc)
+merged = combine_queries([q1, q2], "or")
+
+filter_criteria = [
+    {"attribute": "source_organism", "value": "Escherichia coli", "operator": "exact_match"},
+    {"attribute": "resolution", "value": (2, 2.2), "operator": "range"}
+   ]
+
+
+one_shot_df = query_candidates(
+    search_criteria=[merged],  # a list of built objects
+    fetch_fields=["source_organism", "resolution", "weight"], 
+    filter_criteria=filter_criteria,
+    return_type="assembly",
+)
+print(one_shot_df)
+
+downloads = download_candidates(one_shot_df)
+
+dist_df = run_ring_analysis(downloads)
+
+print(dist_df)
