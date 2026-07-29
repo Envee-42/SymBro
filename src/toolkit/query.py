@@ -36,15 +36,16 @@ from rcsbapi.data import DataQuery
 SEARCH_ATTRIBUTES = {
     # HIERARCHY & SYMMETRY
     "symmetry": "rcsb_struct_symmetry.symbol",
-    "oligomeric_count": "pdbx_struct_assembly.oligomeric_count",
+    "oligomeric_count": "rcsb_assembly_info.polymer_entity_instance_count",
     "stoichiometry": "rcsb_struct_symmetry.stoichiometry",
+    "oligomeric_state": "rcsb_struct_symmetry.oligomeric_state",
 
     # SCALE & MASS
     "polymer_entity_count": "rcsb_assembly_info.polymer_entity_count",
     "composition": "rcsb_assembly_info.polymer_composition",
     "weight": "rcsb_assembly_info.molecular_weight",
 
-    # PROTEIN DESIGN & ORIGIN
+    # DESIGN & ORIGIN
     "source_organism": "rcsb_entity_source_organism.scientific_name",
     "polymer_entity_type": "rcsb_entry_info.selected_polymer_entity_types",
 
@@ -107,7 +108,7 @@ RANGE_HINTED_ATTRIBUTES = {
 }
 
 
-def query(attribute, value, operator="exact_match"):
+def query(attribute, value, operator):
     """
     Build a single Search API query object from one filter criterion.
 
@@ -126,6 +127,17 @@ def query(attribute, value, operator="exact_match"):
         q_low = AttributeQuery(attribute=path, operator="greater_or_equal", value=low)
         q_high = AttributeQuery(attribute=path, operator="less_or_equal", value=high)
         return q_low & q_high
+
+    # 2. General list/array operator handling
+    # If a list/tuple/set was passed, upgrade exact_match to "in"
+    if isinstance(value, (list, tuple, set)):
+        if operator == "exact_match":
+            operator = "in"
+        value = list(value)
+
+    # If "in" was explicitly specified, ensure value is a list
+    elif operator == "in":
+        value = [value]
 
     return AttributeQuery(attribute=path, operator=operator, value=value)
 
@@ -154,16 +166,6 @@ def search_by_criteria(criteria, mode="and", return_type="assembly"):
     General-purpose, DATA-DRIVEN search: any number of filters, any mix of
     exact-match and range criteria, combined with AND or OR — all described
     as plain data (a list of dicts) rather than Python code.
-
-    Why this exists alongside query()/combine_queries()/search_ids(): those
-    three are the low-level building blocks, meant for you to call directly
-    in a notebook when you already know exactly what you want. This function
-    exists for anything that PRODUCES a search as data instead of code — the
-    main example being a future NiceGUI form, where a user ticks boxes and
-    fills in ranges, and the UI code just assembles a `criteria` list from
-    those widgets and hands it straight to this one function. No query-
-    building logic needs to live inside the UI code that way.
-
     criteria : list of dicts, each shaped like one of:
         {"attribute": "symmetry", "value": "T"}
         {"attribute": "resolution", "value": (0, 2.5), "operator": "range"}
@@ -179,20 +181,6 @@ def search_by_criteria(criteria, mode="and", return_type="assembly"):
     combined = combine_queries(queries, mode=mode) if len(queries) > 1 else queries[0]
     return search_ids(combined, return_type=return_type)
 
-
-def search_by_symmetry(symbols, return_type="assembly"):
-    """
-    Convenience shortcut over search_by_criteria for the common case:
-    search by one or more symmetry symbols, combined with OR. Kept mainly
-    for quick one-liners in a notebook — feel free to bypass it and call
-    search_by_criteria directly if you'd rather.
-
-    symbols : a single symbol ("T") or a list of symbols (["T", "O"])
-    """
-    if isinstance(symbols, str):
-        symbols = [symbols]
-    criteria = [{"attribute": "symmetry", "value": s} for s in symbols]
-    return search_by_criteria(criteria, mode="or", return_type=return_type)
 
 def extract_leaf_values(val):
     """

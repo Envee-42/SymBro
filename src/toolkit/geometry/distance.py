@@ -173,7 +173,7 @@ def group_chains_by_sequence(model):
     return list(groups.values())
 
 
-def find_best_rings_by_group_distance(chain_names, chain_geometry, ring_size):
+def find_best_rings_by_group_distance(chain_names, chain_geometry, ring_size, tolerance=1.5):
     """
     Directly evaluates EVERY possible group of `ring_size` chains within
     one same-sequence identity group, scores each by how tightly packed
@@ -208,16 +208,46 @@ def find_best_rings_by_group_distance(chain_names, chain_geometry, ring_size):
     grouping) gets first claim on its own chains before a worse grouping
     has a chance to steal one of them.
 
+    Quality cutoff: without a floor, greedy assignment happily keeps going
+    after the real rings are claimed — it'll force whatever chains are
+    LEFT OVER into additional "rings" too, no matter how loose, right down
+    to extra copies in the asymmetric unit, mismatched leftover chains, or
+    genuinely non-equivalent groupings, none of which are real cage
+    subunits. To prevent that: the first accepted group's score becomes an
+    anchor, and any later candidate whose score exceeds anchor + tolerance
+    stops the search entirely (candidates are sorted tightest-first, so
+    once one candidate fails the cutoff, every remaining one is at least
+    as loose and would fail too). Chains that don't end up in any group
+    within tolerance of the tightest ring are left unassigned rather than
+    forced into a bad one — that's the correct outcome, not a bug, when
+    those chains genuinely aren't part of an equivalent ring.
+
+    This deliberately doesn't hardcode an expected ring COUNT (e.g. 4 for
+    a tetrahedral cage) — that number is a property of point-group
+    symmetry and would need separate logic per symmetry type (8 for
+    octahedral, 20 for icosahedral, etc.), and gets it for free once
+    tightness is bounded correctly: a tetrahedral assembly's 4 trimers are
+    all real and comparably tight, so all 4 pass the cutoff together.
+
+    tolerance : same units as the centroid-distance sum being scored
+    (Angstroms), and conceptually the same tolerance later used by
+    deduplicate_rings_by_geometry on nc_distance — but it's a genuinely
+    different metric (summed pairwise centroid distances here vs. a
+    single junction's NC distance there), so treat the shared default as
+    a reasonable starting heuristic, not a guarantee the two should always
+    match. Widen it if real assemblies with more geometric asymmetry
+    between equivalent rings start getting split up unnecessarily.
+
     Complexity note: for m chains this evaluates C(m, ring_size)
     combinations — e.g. 220 for 12 chains at ring_size=3, still only in
     the tens of thousands even for a 60-chain icosahedral cage. Cheap
     enough not to worry about.
 
     Returns a list of chain-name groups (each of length ring_size). Chains
-    that can't be placed into any complete, non-overlapping group are left
-    out entirely rather than padded — worth checking len(groups) *
-    ring_size against len(chain_names) if you want to confirm nothing was
-    dropped.
+    left out (either by the overlap rule or the tolerance cutoff above)
+    are excluded entirely rather than padded — worth checking
+    len(groups) * ring_size against len(chain_names) if you want to
+    confirm how many were dropped and why.
     """
     candidates = []
     for group in combinations(chain_names, ring_size):
@@ -231,10 +261,16 @@ def find_best_rings_by_group_distance(chain_names, chain_geometry, ring_size):
 
     assigned = set()
     rings = []
+    anchor_score = None
     for score, group in candidates:
-        if assigned.isdisjoint(group):
-            rings.append(list(group))
-            assigned.update(group)
+        if not assigned.isdisjoint(group):
+            continue  # a member of this group was already claimed by a tighter ring
+        if anchor_score is None:
+            anchor_score = score  # first accepted group sets the quality bar
+        elif score - anchor_score > tolerance:
+            break  # this and every remaining (looser) candidate fail the cutoff
+        rings.append(list(group))
+        assigned.update(group)
 
     return rings
 
@@ -334,7 +370,66 @@ def deduplicate_rings_by_geometry(rings, tolerance=1.5):
     return representatives
 
 
-def analyze_assembly_rings(filepath, assembly_id, ring_size, tolerance=1.5):
+def _apply_annotators(ring, chain_geometry, annotators):
+    """
+    Runs each function in `annotators` over one ring in order, chaining
+    output into input — the result of annotator N is what annotator N+1
+    receives. Each annotator's contract: annotator(ring, chain_geometry)
+    -> ring (a dict — either the same one with fields added, or a new one;
+    orientation.annotate_ring_orientation is the reference implementation
+    this contract is built around).
+
+    chain_geometry is already sitting in memory at the point this gets
+    called (built once per assembly inside analyze_assembly_rings) — this
+    is the whole point of doing annotation here rather than downstream:
+    every annotator reuses that same structure load instead of each one
+    re-parsing the PDB file from scratch. As more annotators are added
+    (secondary structure, solvent accessibility), they all share this one
+    load too.
+
+    A failing annotator prints a warning naming the annotator and the
+    ring's junction, then the loop continues with whatever the ring
+    dict looked like going in — one broken annotator doesn't lose the
+    ring or any annotations that already succeeded on it.
+    """
+    for annotator in annotators:
+        try:
+            ring = annotator(ring, chain_geometry)
+        except Exception as e:
+            print(f"Annotator {annotator.__name__} failed on "
+                  f"{ring.get('from_chain')}->{ring.get('to_chain')}: {e}")
+    return ring
+
+
+def _flatten_ring_row(ring):
+    """
+    Flattens one ring dict into a single-level dict suitable for a
+    DataFrame row. Any value that's itself a dict (e.g. the "orientation"
+    field an annotator adds) gets its keys pulled up one level with the
+    parent key as a prefix — "orientation": {"backbone_angle": 12.4, ...}
+    becomes "orientation_backbone_angle": 12.4 — so results land as plain
+    sortable/filterable columns instead of a dict blob per cell that has
+    to be unpacked before it's usable.
+
+    A None value (an annotator that ran but found nothing computable —
+    see annotate_ring_orientation) is dropped rather than kept as a bare
+    key: pandas fills it in as NaN automatically for that column once
+    other rows populate it, which reads cleaner than a stray all-null
+    "orientation" column sitting alongside the flattened ones.
+    """
+    row = {}
+    for key, value in ring.items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            for subkey, subvalue in value.items():
+                row[f"{key}_{subkey}"] = subvalue
+        else:
+            row[key] = value
+    return row
+
+
+def analyze_assembly_rings(filepath, assembly_id, ring_size, tolerance=1.5, annotators=None):
     """
     Full per-assembly ring pipeline: load the structure, compute chain
     geometry, group chains by sequence identity (the two-component
@@ -365,6 +460,17 @@ def analyze_assembly_rings(filepath, assembly_id, ring_size, tolerance=1.5):
     per DISTINCT ring geometry found (within tolerance), potentially still
     more than one if the assembly's rings aren't all equivalent (e.g. a
     genuinely asymmetric arrangement, or more than one identity group).
+
+    annotators : optional list of per-ring annotator functions, e.g.
+        [orientation.annotate_ring_orientation]. Each runs against this
+        assembly's already-loaded chain_geometry (see _apply_annotators)
+        right here, before the rings are returned — so orientation (and
+        later, secondary structure / solvent accessibility) never needs
+        the caller to reload the structure a second time downstream. This
+        is the only wiring distance.py has to those modules: it never
+        imports them itself, so pass whichever annotator functions you
+        want at the call site and distance.py stays agnostic to what they
+        compute.
     """
     st = gemmi.read_structure(filepath)
     model = st[0]
@@ -382,15 +488,18 @@ def analyze_assembly_rings(filepath, assembly_id, ring_size, tolerance=1.5):
         usable = [name for name in group if name in chain_geometry]
         if len(usable) < ring_size:
             continue
-        for chain_group in find_best_rings_by_group_distance(usable, chain_geometry, ring_size):
+        for chain_group in find_best_rings_by_group_distance(usable, chain_geometry, ring_size, tolerance=tolerance):
             rings.append(find_shortest_ring_junction(chain_group, chain_geometry))
 
     rings = deduplicate_rings_by_geometry(rings, tolerance=tolerance)
 
+    if annotators:
+        rings = [_apply_annotators(ring, chain_geometry, annotators) for ring in rings]
+
     return {"assembly_id": assembly_id, "rings": rings}
 
 
-def run_ring_analysis(df, ring_size, filepath_column="filepath", assembly_id_column="assembly_id", tolerance=1.5):
+def run_ring_analysis(df, ring_size, filepath_column="filepath", assembly_id_column="assembly_id", tolerance=1.5, annotators=None):
     """
     Runs analyze_assembly_rings across every row of a candidates DataFrame,
     flattening the (possibly several) DISTINCT rings found per assembly
@@ -407,6 +516,26 @@ def run_ring_analysis(df, ring_size, filepath_column="filepath", assembly_id_col
     tolerance : passed straight through to deduplicate_rings_by_geometry
         for every assembly in the batch — see that function for what it
         controls.
+    annotators : optional list of per-ring annotator functions, passed
+        straight through to analyze_assembly_rings for every assembly in
+        the batch (see that function's docstring). Their output is
+        flattened into plain DataFrame columns by _flatten_ring_row — e.g.
+        passing [orientation.annotate_ring_orientation] adds
+        orientation_backbone_angle / orientation_from_alignment /
+        orientation_to_alignment columns to the result, with no separate
+        structure reload and no manual caching required at the call site:
+
+            from toolkit.geometry.orientation import annotate_ring_orientation
+            rings_df = run_ring_analysis(
+                candidates_df, ring_size=3, annotators=[annotate_ring_orientation]
+            )
+
+        This is deliberately for cheap, numeric per-ring annotations only.
+        It does NOT run plotting or anything else expensive per row — with
+        potentially hundreds of candidates, generating a figure for every
+        row isn't something you want happening automatically. Keep
+        plotting a separate, deliberate step on whichever specific rows
+        you actually want to look at (e.g. the top few after sorting).
     """
     rows = []
     for _, row in df.iterrows():
@@ -418,10 +547,11 @@ def run_ring_analysis(df, ring_size, filepath_column="filepath", assembly_id_col
 
         try:
             result = analyze_assembly_rings(
-                row[filepath_column], assembly_id, ring_size=this_ring_size, tolerance=tolerance
+                row[filepath_column], assembly_id, ring_size=this_ring_size,
+                tolerance=tolerance, annotators=annotators,
             )
             for ring in result["rings"]:
-                rows.append({"assembly_id": assembly_id, **ring})
+                rows.append({"assembly_id": assembly_id, **_flatten_ring_row(ring)})
         except Exception as e:
             print(f"Failed: {assembly_id} — {e}")
 
