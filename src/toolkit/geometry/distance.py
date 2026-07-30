@@ -7,96 +7,388 @@ Two paths live here:
 
   - compute_nc_distance / process_candidates: single-closest-pair NC
     distance, kept as a lighter-weight utility for other uses.
-  - analyze_assembly_rings / run_ring_analysis: the primary path — groups
-    chains directly into full oligomeric rings (e.g. all 3 chains of a
-    trimer) by scoring whole candidate groups rather than relying on
-    pairwise closest-centroid matching, then finds the best fusion
-    ordering within each ring.
+  - analyze_assembly_rings / run_ring_analysis: the primary path — finds
+    complete oligomeric rings (e.g. all 3 chains of a trimer) AND their
+    correct chain-to-chain fusion order in one step, via the directed
+    terminal-cycle method described below, then reports each ring's best
+    (and full) fusion junction(s).
 
-RING SIZE — "Challenge 1": recognizing how many chains belong in a ring.
-Platonic-solid-type cages (the T / O / I point groups referenced in the
-Yeates lab's mathematical framework this tool is built around) only ever
-have 2-, 3-, 4-, and 5-fold rotational symmetry axes — T has 2- and
-3-fold, O adds 4-fold, I adds 5-fold, and nothing in this family has a
-6-fold (or higher) axis. So a chain ring can only ever be a dimer,
-trimer, tetramer, or pentamer — see ALLOWED_RING_SIZES. Rather than
-requiring the caller to already know which one applies (from RCSB
-metadata that may be missing, wrong, or simply not fetched), this module
-can AUTO-DETECT the ring size per sequence-identity group by trying every
-allowed size and keeping whichever one best explains the group's actual
-chain positions — see detect_ring_size(). An explicit ring_size is still
-accepted (and skips auto-detection) for the case where you already trust
-a metadata field like oligomeric_count.
+ORIGIN — this module's ring-detection logic began as a direct
+generalization of one manual, exploratory notebook analysis (Phase_2.ipynb)
+that correctly identified all 8 trimers of a real downloaded cage (PDB
+3vcd, 24 chains) by eye: compute every chain's centroid, sort all pairwise
+centroid distances, notice the sharp gap between "same ring" (~34Å) and
+"different ring" (~100Å+) distances, and print every chain trio whose
+worst internal distance stayed under a hand-picked cutoff (35.0Å). That
+worked, but only because it was tuned by eye for one specific structure,
+assumed the ring size (3) was already known, assumed there'd be no overlap
+between candidate trios to resolve, and offered no way to tell a genuinely
+clean call apart from a lucky one.
 
-WHY RAW TIGHTNESS ALONE FAILS — a cage's chain-to-chain distances reflect
-EVERY symmetry axis present at once, not just the one you care about. An
-octahedral (O) cage built from 8 trimers has 2-, 3-, and 4-fold axes all
-acting on the same 24 chains, and the 2-fold "cage-forming" contact
-between neighboring trimers is very often TIGHTER than the trimer's own
-3-fold "oligomerization" contact — that's a normal, expected feature of
-efficient cage packing, not a defect. Two consequences follow:
+HISTORY (superseded approaches, kept as design record):
 
-  1. A candidate GROUP of chains can be spuriously tight simply because
-     it mixes members of two DIFFERENT true rings connected by that tight
-     inter-ring contact (e.g. two chains from one trimer plus one from
-     its neighbor) — this can outscore the real, uncontaminated trimer on
-     raw summed distance alone. The fix: _group_combinations_info also
-     scores each candidate's shape UNIFORMITY (the coefficient of
-     variation, or CV, of its internal pairwise distances), and
-     candidates whose CV exceeds a size-specific threshold (see
-     _ideal_ring_shape_cv / RING_SHAPE_CV_JITTER_MARGIN) are excluded
-     outright before any ranking happens. A genuine n-gon has consistent, predictable spacing
-     between its members (dimers/trimers: CV=0, exactly uniform by
-     geometry; tetramers/pentamers: CV≈0.17/0.24, from the fixed
-     adjacent-vs-diagonal ratio of a regular polygon); a group
-     contaminated with a member from a different true ring does not.
+  1. Atomic-contact-based detection — built a graph from actual Cα–Cα
+     atomic contacts, on the theory that real interface SIZE, not just
+     centroid proximity, should be the most reliable signal for which
+     chains belong to the same designed ring. Worked on synthetic
+     geometry but failed on real downloaded structures (frequently
+     returned dimers instead of trimers) — real "identical" copies of one
+     ring aren't perfectly identical at the atomic level (crystallographic
+     disorder, minor conformational asymmetry, different residues
+     resolved in different copies), so noise disproportionately breaks
+     larger rings while leaving spurious dimers intact. Abandoned.
 
-  2. Even after contamination is filtered out, a real trimer and the
-     genuine (tight, uniform) inter-trimer dimers next to it can BOTH be
-     valid, fully-covering, internally-uniform decompositions of the same
-     chain set — this isn't resolved by picking whichever is tighter
-     (that would always favor the smaller ring, since a cage's
-     inter-subunit contacts are so often engineered to be tight). Per
-     point-group theory, a higher-order rotation axis's symmetry already
-     implies/contains the lower-order axes as a byproduct — so whenever
-     multiple ring sizes independently give a valid, uniform, adequately-
-     covering decomposition (see RING_SIZE_COVERAGE_FLOOR),
-     detect_ring_size prefers the LARGEST one outright, rather than
-     comparing tightness across sizes. An earlier version tried to
-     resolve size ambiguity with a per-ring "isolation ratio" (how much
-     farther a ring's nearest outside chain sits) — that correctly caught
-     one failure mode (an even ring size like a tetramer trivially
-     subdividing into tight adjacent-pair "dimers", where the excluded
-     chains really are the SAME true ring's other members) but wrongly
-     penalized this one (a genuine, separate, uniform trimer whose
-     neighbor just happens to sit close by, by design) — so it's been
-     replaced by the size-preference rule above, which handles both.
+  2. Centroid-distance combinatorial group-scoring — the previous version
+     of this module. For each candidate ring_size in turn, it scored
+     EVERY possible group of that size within a sequence-identity group
+     (C(n, size) candidates) by summed/mean pairwise CENTROID distance,
+     filtered by a hand-derived shape-uniformity threshold (coefficient
+     of variation vs. an ideal regular n-gon) to reject groups that mixed
+     chains from two different true rings, then had to arbitrate BETWEEN
+     candidate sizes when more than one produced a fully-covering,
+     uniform reading of the same chains (coverage-first, with point-group
+     nesting as a tie-break). This worked, but at real cost: it required
+     trying every ring_size explicitly (an actual list of "candidate
+     sizes to attempt", not true size-agnosticism), its combinatorial
+     cost grew as C(n, size) per size attempted (capped by
+     MAX_RING_CANDIDATE_COMBINATIONS to avoid pathological blowups), and
+     a large fraction of its logic (CV filtering, coverage floors,
+     nesting tie-breaks) existed purely to compensate for centroid
+     distance being a coarse, orientation-blind signal: two chains can
+     have close centroids for reasons that have nothing to do with being
+     genuine ring-mates (e.g. a neighboring ring's cage-forming contact).
+     Superseded by the directed terminal-cycle method below.
 
-REDUNDANCY — avoiding, e.g., reporting a tetrahedron's 4 physically
-equivalent trimers as 4 separate findings. deduplicate_rings_by_geometry()
-collapses rings that are the SAME ring (related by the assembly's own
-symmetry) into one representative, by comparing each ring's full pairwise-
-distance "fingerprint" rather than just its single nc_distance number —
-see that function's docstring for why a single-number comparison isn't
-accurate enough on its own.
+REDESIGN — size-agnostic directed terminal cycles (current approach):
+this module now builds ring membership AND ring order directly from
+N-to-C terminal proximity, rather than from whole-chain centroid
+proximity, and rather than trying candidate ring sizes one at a time.
 
-TOLERANCE — real structures never hit exact symmetry: crystal packing,
-minor conformational differences, and refinement noise mean two
-"identical" copies of the same ring will never measure out to bit-for-bit
-identical distances. Every distance-based decision in this module (same-
-size ring acceptance, cross-size comparison, redundancy collapsing) is
-governed by one user-adjustable `tolerance` parameter, in Angstroms —
-widen it if real assemblies are coming out more fragmented/asymmetric
-than they should; narrow it if unrelated chains are being merged. Ring
-shape uniformity (RING_SHAPE_CV_JITTER_MARGIN) and coverage
-(RING_SIZE_COVERAGE_FLOOR) are separate, dimensionless knobs — they're
-about whether a candidate group's SHAPE is coherent at all, which
-tolerance alone can't express.
+The physical insight: in a cyclic C_n assembly meant to be fused into one
+continuous polypeptide, the chains are arranged head-to-tail in a single
+rotational direction. If chain A's C-terminus sits near chain B's
+N-terminus, then by the assembly's own rotational symmetry, B's
+C-terminus must sit near some OTHER chain's N-terminus (call it C), and so
+on, until the path closes back on A. That closed path — not centroid
+clustering — is what actually defines a ring, and IS the fusion order,
+for free, with no separate step needed to find "the best junction" among
+an already-identified but unordered group of chains.
+
+Mechanically:
+
+  1. EXTRACT TERMINI — for every chain, take its N-terminal and
+     C-terminal CA coordinates from termini.get_chain_ca_geometry
+     (already computed once per chain elsewhere in the pipeline).
+
+  2. BUILD A DIRECTED INTERFACE MATRIX — d_term(i -> j) = || C_i - N_j ||
+     for every ordered pair i != j. This is NOT symmetric: C_i -> N_j and
+     C_j -> N_i are unrelated numbers, because a cyclic interface has a
+     direction (see _directed_terminal_matrix).
+
+  3. THRESHOLD IT INTO A GRAPH — a directed edge i -> j exists only where
+     d_term(i -> j) <= terminal_threshold (tau), a distance in Angstroms
+     tight enough that the two termini are plausibly close enough to link
+     (see build_terminal_graph and DEFAULT_TERMINAL_THRESHOLD).
+
+  4. FIND ELEMENTARY CYCLES — run cycle-finding (networkx's simple_cycles,
+     an implementation of Johnson's algorithm, bounded to the longest
+     physically possible ring — see find_ring_cycles) on that graph. Every
+     closed, non-self-intersecting cycle k1 -> k2 -> ... -> kn -> k1 found
+     is a candidate ring, and its LENGTH is automatically that ring's
+     size — no candidate size ever has to be proposed, tried, or ranked
+     against alternatives: a genuine C2/C3/C4/C5 ring shows up as exactly
+     that, a 2/3/4/5-node cycle, because that's what it structurally is.
+     A candidate is also required to have internally CONSISTENT junction
+     distances (see JUNCTION UNIFORMITY below) before it's kept at all.
+
+  5. RESOLVE OVERLAP — a noisy or densely-linked graph can produce more
+     candidate cycles than there are real rings (e.g. two cycles sharing a
+     chain, or one real ring plus a spurious alternate path through the
+     same nodes). _greedy_nonoverlapping_cycles walks every candidate
+     tightest-first and accepts EVERY one that doesn't reuse an
+     already-claimed chain — full stop. It does not additionally require
+     a non-overlapping candidate to be within some tolerance of the very
+     first (tightest) ring accepted (see BUGFIX below for why that
+     earlier design was actively harmful, not just overly cautious).
+
+What this eliminates from the old approach, and why it's not needed
+anymore: there is no more shape-uniformity CV filter, because a spurious
+group can no longer sneak through on raw distance alone — surviving as a
+candidate now requires an entire consistent, closed, DIRECTED loop across
+every one of its members, a far stronger simultaneous constraint than
+"these centroids happen to be close together". There is no more
+combinatorial candidate-count cap (MAX_RING_CANDIDATE_COMBINATIONS),
+because cost is now driven by the actual (typically sparse — most chains
+have only one or two termini within tau of them) terminal-contact graph,
+not by C(n, size) over every chain in an identity group. Ambiguity
+between candidate sizes, on the other hand, is NOT eliminated — an
+earlier cut of this redesign tried to resolve it by picking one "winning"
+size per group (first by pooling every size together and ranking by raw
+tightness, then by coverage when that proved wrong — see git history /
+prior revisions of this docstring). Real testing on real cages proved
+picking a single winner IS the wrong framing entirely: see TOTAL-COVERAGE
+AXIS SELECTION below for why every size that geometrically, fully
+accounts for the group is now reported side by side, with no size ever
+declared "the" answer by this module alone.
+
+BUGFIX — dropped rings from an over-eager tolerance cutoff: the first cut
+of this redesign kept the old module's "anchor + tolerance, stop once
+exceeded" acceptance rule (see TOLERANCE below), just applied globally
+across pooled candidate cycles instead of per ring_size. On a real
+downloaded cage (8FNV-1) this produced exactly 3 of 4 real trimers: the
+4th was a completely disjoint, valid cycle over exactly the chains left
+over once the other 3 were claimed — not spurious, not overlapping
+anything — but its mean junction distance happened to be more than
+`tolerance` looser than the very first (tightest) ring accepted, so the
+anchor+tolerance cutoff stopped searching before it was ever reached.
+That cutoff was never actually protecting anything: the only thing that
+can make a candidate cycle wrong is reusing chains an already-accepted,
+tighter cycle claimed first, and disjoint chain sets already rule that
+out on their own. A real cage's several rings are not guaranteed to be
+equally tight to begin with — different local packing, resolution, or
+how many residues happened to resolve per copy can all make one ring's
+junctions measurably looser than another's without either being fake.
+Conflating that expected between-ring variation with genuine noise is
+what silently dropped a ring that was, by the time it mattered, the only
+candidate left standing for its chains. Fixed by dropping the
+tolerance-gated stop entirely — see RESOLVE OVERLAP above and
+_greedy_nonoverlapping_cycles.
+
+JUNCTION UNIFORMITY — filtering implausible cycles before they're ever
+ranked. Raw distance and closed-loop topology alone (steps 1-5 above)
+still leave one gap: a cycle can be entirely real in the sense of every
+individual link clearing terminal_threshold, non-overlapping with
+anything else, and yet still be the WRONG cycle, because the closest
+available terminus by raw distance isn't always the true ring-mate's
+(see LIMITATIONS below — observed on a real downloaded cage, 1WPB-2,
+with unusually long, winding chains). The fix — suggested directly by
+comparing what a genuine ring's geometry has to look like against what
+an accidental one doesn't — is to also check each candidate's junctions
+against EACH OTHER, not just against terminal_threshold individually: in
+a real C_n ring, every consecutive junction is the SAME physical
+interface, repeated around the ring by the assembly's own rotational
+symmetry, so their Cα-Cα distances should track each other closely,
+give or take ordinary biological jitter. A cycle stitched together from
+coincidentally-close-but-non-corresponding termini has no such symmetry
+forcing its links to agree — so requiring that they agree (within
+max_junction_spread — see DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE) rejects
+a class of wrong-but-otherwise-plausible cycles that distance and
+topology alone can't tell apart from real ones. This is find_ring_cycles'
+job, applied per candidate before find_ring_cycles even returns it, so it
+is a per-candidate structural check — unlike the BUGFIX above, it never
+compares one candidate against another, and so can't reintroduce that
+same failure mode (a genuinely internally-consistent ring is never
+penalized just because some other ring elsewhere happens to be tighter
+or looser).
+
+INTERFACE CONTACT SANITY CHECK — a second, independent per-candidate
+filter, also applied before greedy acceptance, targeting the specific
+1WPB-2 failure mode JUNCTION UNIFORMITY alone didn't fully catch:
+unusually long, winding chains where a chain's termini can genuinely
+reach across to a chain it doesn't otherwise pack against anywhere. The
+obvious first idea — require the two chains' minimum CA-CA distance
+(over ALL their residues, not just termini) to fall under some cutoff —
+turns out to be tautological and was rejected before being implemented:
+the ring's own junction is itself a CA-to-CA pair (the from_chain
+C-terminus and to_chain N-terminus), so the minimum inter-chain CA-CA
+distance can never exceed the junction distance that already got the
+candidate this far. A minimum-distance check could never actually reject
+anything post-junction; it would just re-confirm what terminal_threshold
+already guaranteed. The non-tautological version — and what's actually
+implemented (_interchain_contact_count / _filter_has_interface_contact)
+— is a COUNT: how many INDEPENDENT residue pairs (not just the one
+already-known-close termini pair) fall within contact_threshold of each
+other. A genuine subunit interface has more than one contact; a chain
+whose termini happen to reach across to an unrelated neighbor, with
+nothing else about either chain nearby, does not. A candidate is dropped
+if any of its own junction pairs falls short of min_contact_pairs — see
+DEFAULT_CONTACT_THRESHOLD / DEFAULT_MIN_CONTACT_PAIRS. Like JUNCTION
+UNIFORMITY, this is a property of one candidate in isolation, never a
+comparison against other candidates, so it can't reintroduce the BUGFIX
+failure mode above. It does require the full per-residue CA trace,
+which termini.get_chain_ca_geometry now also returns ("ca_coords") for
+exactly this purpose — see that function's docstring; a chain_geometry
+built by an older version without that field skips this check with a
+printed explanation rather than erroring.
+
+TOTAL-COVERAGE AXIS SELECTION — replaces an earlier "pick one winning
+size" design (coverage-first, tightness-first — see git history) after
+real testing on real downloaded cages showed picking a single winner was
+the wrong framing. The observed failure that prompted this: on 3VCD (8
+real trimers expected), the method above found only 2 correct trimers
+plus several erroneous dimers. Why: a T/O/I point-group cage's own
+rotational symmetry is NOT limited to the n-fold axis its designed
+subunit oligomerizes around. An octahedral cage built from trimers, for
+instance, also has real 2-fold (and 4-fold) axes relating chains ACROSS
+different trimer copies — that IS the cage's architecture, not noise. A
+pair of chains related by one of these other axes can have reciprocally
+close termini (C_i near N_j AND C_j near N_i — a genuine closed 2-cycle),
+uniform junction distances (trivially, with only 2 links), and a real
+multi-residue interface (cage-forming contacts between neighboring
+trimers are often substantial, sometimes tighter than the trimer's own
+internal spacing — this exact scenario is what the module's own
+ORIGIN/HISTORY notes originally called the "octahedral cage bug" against
+the old centroid method, recurring here against the new terminal-cycle
+method for the same underlying reason under a different mechanism). No
+per-candidate test — distance, uniformity, or contact — can tell such a
+pair apart from a genuine ring-forming junction, because by every one of
+those measures, it IS real.
+
+The fix is to stop trying to pick a winner at all. detect_rings, when
+auto-detecting, runs EVERY candidate size's non-overlapping acceptance
+independently against the WHOLE identity group, and keeps a size's
+result ONLY if it accounts for every single chain in the group — zero
+residual. A size that leaves even one chain unassigned is discarded
+ENTIRELY for that group (not partially reported): a coincidental,
+non-ring-forming pairing only ever explains the specific chains it
+happens to relate, never the whole group, so it fails this test and is
+dropped regardless of how tight or uniform or contact-validated it
+looked in isolation. A size that DOES achieve total coverage is a
+genuine, complete symmetry axis of the assembly by construction — and
+since a real point-group cage can genuinely have more than one such axis
+simultaneously (the octahedral cage's 3-fold AND 2-fold axes are both
+"real" and can both, independently, fully partition the same 24 chains),
+detect_rings does not pick between them: it returns the UNION of every
+size that achieves total coverage, each candidate still tagged with its
+own "ring_size", so the caller (or a human) decides which axis is the
+biologically designed subunit — typically the one matching a trusted
+oligomeric_count from metadata, or the smallest one, or whichever a
+downstream step (RFdiffusion input selection, etc.) actually needs.
+
+This trades one failure mode for a different, more honest one: a size
+that's genuinely correct but only PARTIALLY detected (some real rings
+found, a few chains missed — e.g. due to terminal_threshold /
+max_junction_spread / contact settings being slightly too strict for a
+specific structure) is now discarded in full rather than reported with
+its gaps, since "leaves residual chains" and "is the wrong size" are not
+distinguished by this rule — see 1WPB-2 under LIMITATIONS below for a
+real example, and the printed per-size summary detect_rings emits for
+diagnosing which case you're in. The safest way to avoid this trade-off
+entirely, when available, remains passing an explicit ring_size from
+trusted metadata (oligomeric_count / stoichiometry via query.py's
+fetch_metadata()) — that path never requires total coverage, since
+there's no size ambiguity left to resolve.
+
+REDUNDANCY — a cage assembled from several physically equivalent copies
+of one ring (e.g. a tetrahedron's 4 trimers) still produces one distinct
+cycle PER physical ring — cycle-finding naturally can't merge them, since
+they involve entirely different chains. But nothing stops those several
+equivalent rings from being reported as separate findings when the
+pipeline's actual purpose (design one representative construct per unique
+ring, not once per symmetric copy) only wants one. deduplicate_rings_by_
+geometry() still does this collapsing, unchanged in method from before:
+compare each ring's full pairwise-centroid-distance "fingerprint" (not
+just its single nc_distance number) within `tolerance`, and merge.
+
+TOLERANCE vs. TERMINAL_THRESHOLD — two different knobs, and it matters
+which one you reach for:
+
+  - terminal_threshold (tau) is a HARD, structural gate — "is this
+    specific C-to-N contact even physically plausible as a fusion
+    junction at all?" It controls which edges exist in the graph, and
+    therefore which cycles can even be found in the first place. Too
+    tight and real, slightly-asymmetric ring junctions get missed
+    entirely (a ring silently vanishes); too loose and spurious
+    non-adjacent contacts start appearing as edges (more candidate
+    cycles for the greedy step to have to discriminate between).
+
+  - tolerance, in Angstroms, no longer has anything to do with whether a
+    candidate ring gets accepted (see BUGFIX above) — it now governs
+    exactly one thing: how far apart two rings' fingerprints may be and
+    still be treated as the same physical ring by
+    deduplicate_rings_by_geometry. Real structures never hit exact
+    symmetry (crystal packing, minor conformational differences,
+    refinement noise), so this absorbs that biological jitter when
+    collapsing symmetric copies; it has no effect on which edges/cycles
+    exist, or on which non-overlapping cycles get accepted as rings.
+
+LIMITATIONS — this method is only as good as the assumption it's built
+on: that an engineered cyclic ring's true adjacent-chain junction really
+is the closest C-to-N contact its termini have available. If a chain's
+true ring-mate's N-terminus is NOT its single closest N-terminus overall
+— e.g. some other, unrelated chain's N-terminus happens to sit even
+closer by coincidence — tightest-first greedy acceptance (see
+_greedy_nonoverlapping_cycles) will prefer that tighter but biologically
+wrong edge, and the true ring's cycle can fail to close at all, or close
+around the wrong chain. This is a narrower failure mode than the old
+centroid-based method's equivalent risk (two whole CHAINS coincidentally
+sitting close together, for reasons unrelated to their specific termini)
+— a false edge here requires an actual terminus-level coincidence, not
+just a whole-chain one — but it isn't impossible. A ring silently missing
+from the results is worth a manual sanity check (e.g. against a trusted
+oligomeric_count from metadata) rather than trusted blindly on a novel
+structure, same as it would have been under the old method.
+
+A second, distinct limitation comes directly from TOTAL-COVERAGE AXIS
+SELECTION above: when auto-detecting, a candidate size that's genuinely
+correct but only PARTIALLY found (a real ring size, with a few real
+copies missed due to terminal_threshold / max_junction_spread / contact
+settings being a little too strict for this specific structure) is
+INDISTINGUISHABLE, by this module's own total-coverage rule, from a size
+that's simply wrong — both leave residual chains, and both get discarded
+entirely. This means a size can vanish from the results not because it
+isn't real, but because detection under-counted it by even one ring. See
+1WPB-2 below for a concrete case, and detect_rings' printed per-size
+summary for how to tell the two apart on a specific structure (a size
+discarded with only 1-2 chains left over, close to a plausible ring's
+worth, is far more likely under-detected than genuinely wrong).
+
+Observed in practice on real downloaded cages, updated as each round of
+mitigations was tried against real data (not synthetic geometry) rather
+than left as a one-time note:
+
+  - 1WPB-2 (geometrically unusual — long, winding chains rather than
+    compact globular subunits), FIRST observation: the ring that got
+    accepted was internally consistent but not the biologically intended
+    trio — a winding chain's closest terminus by raw distance isn't
+    guaranteed to be its true ring-mate's. AFTER adding JUNCTION
+    UNIFORMITY and INTERFACE CONTACT SANITY CHECK: the WRONG-chains
+    failure mode was gone — the correct chains were being identified —
+    but only 5 of the real 8 rings were found; the other 3 were missing
+    entirely, not misassigned. Under the CURRENT total-coverage rule,
+    this specific result (5 of 8, 3 chains left over) would now be
+    discarded ENTIRELY rather than returned partially — see the second
+    LIMITATIONS paragraph above. This remains an open, unresolved
+    detection-sensitivity problem as of this writing — the honest fix
+    requires calibrating against 1WPB-2's own actual numbers (which
+    junctions/contacts the 3 missing rings have, and how far short of the
+    defaults they fall), not a blind default change with no real
+    structure to check it against. See detect_rings' printed per-size
+    summary for a starting point, and try rerunning with
+    max_junction_spread=None and/or contact_threshold=None to see
+    whether either recovers total coverage — or pass an explicit
+    ring_size=3 for this structure, which bypasses the total-coverage
+    requirement entirely and returns whatever it finds, gaps included.
+
+  - 3VCD (8 real trimers expected): only 2 real trimers plus several
+    erroneous dimers were found, under the old single-winner design. This
+    was NOT a distance, uniformity, or contact problem — it was the
+    cage's own additional symmetry axes (see TOTAL-COVERAGE AXIS
+    SELECTION above) being read as a competition to resolve rather than
+    as multiple simultaneously-real answers to report. Under the CURRENT
+    design, whichever size(s) among 2/3/4/5 achieve total coverage of
+    this 24-chain group are ALL returned, tagged by ring_size — the real
+    3-fold trimer axis should now appear complete (8 rings, 24/24 chains)
+    alongside any other size that also happens to achieve total coverage,
+    rather than one being silently preferred over the other.
+
+If terminal_threshold / max_junction_spread / contact_threshold /
+min_contact_pairs tuning still leaves real rings missing after checking
+per the 1WPB-2 note above, the next untried lead is directional:
+n_vector/c_vector (see termini.get_chain_ca_geometry) describe each
+terminus's local backbone direction, and a genuine fusion junction should
+have the upstream chain's C-terminus pointing roughly toward the
+downstream chain's N-terminus, not just sitting near it. Scoring
+candidate edges by that directional consistency — the same information
+orientation.py already uses for a DIFFERENT purpose (judging linker
+difficulty for an already-chosen junction) — remains a plausible
+follow-up, not yet implemented.
 """
 
 from itertools import combinations
-from math import comb
+
 import gemmi
+import networkx as nx
 import numpy as np
 import pandas as pd
 
@@ -113,59 +405,57 @@ from toolkit.geometry.termini import get_chain_ca_geometry
 # ring_size validates against this — a ring_size outside this set isn't a
 # looser/stricter setting, it's a physically impossible request, so it's
 # rejected rather than silently attempted.
-ALLOWED_RING_SIZES = (3, 3)
+ALLOWED_RING_SIZES = (2, 3, 4, 5)
 
-# Ring-size auto-detection (detect_ring_size) and the underlying combinatorial
-# group scoring (find_best_rings_by_group_distance) both work by scoring
-# EVERY possible group of chains of a given size — C(n, ring_size)
-# candidates for n chains in one identity group. That's cheap for the
-# common cases (a few dozen chains, ring_size <= 5), but auto-detection
-# blindly tries ring_size=5 even for assemblies where it's the wrong
-# answer, and C(n, 5) grows fast — e.g. C(60, 5) is ~5.46 million. Rather
-# than let a single bad candidate size silently make a run take minutes,
-# any size whose candidate count exceeds this cap is skipped with a
-# printed warning. Raise it explicitly (per-call) if you have a specific,
-# known-large case that genuinely needs it.
-MAX_RING_CANDIDATE_COMBINATIONS = 200_000
+# Default tau: the maximum C_i -> N_j distance (Angstroms) for a directed
+# terminal contact to be considered a plausible fusion junction at all,
+# and therefore to exist as an edge in the terminal graph at all (see
+# build_terminal_graph). Chosen at the permissive end of the ~10-15Å range
+# real linked/closely-interacting termini fall in: it's cheaper to let a
+# few extra, non-adjacent contacts appear as edges (the tightness-ranked,
+# non-overlapping cycle acceptance in detect_rings sorts those out) than
+# to silently miss a real ring because one of its junctions runs a little
+# wide of a stricter cutoff. Narrow this per-call if a specific structure
+# is producing spurious extra edges/cycles; widen it if a real ring isn't
+# being found at all.
+DEFAULT_TERMINAL_THRESHOLD = 15.0
 
-# Shape-uniformity gate: candidates whose internal pairwise centroid
-# distances aren't consistent enough to plausibly be a real n-gon are
-# excluded before any tightness-based ranking happens (see
-# _filter_uniform_shape / _ideal_ring_shape_cv). Consistency is judged by
-# coefficient of variation (CV = standard deviation / mean of the
-# candidate's pairwise distances) against the THEORETICAL CV of an ideal
-# regular n-gon of that ring_size — a dimer/trimer's is exactly 0 (a
-# dimer has only one pairwise distance; an equilateral triangle's three
-# edges are all equal), a tetramer's ≈0.1716 and a pentamer's ≈0.2361
-# (both from the fixed adjacent-vs-diagonal ratio of a regular polygon —
-# see _ideal_ring_shape_cv). Using a SIZE-SPECIFIC bound rather than one
-# flat number matters: a flat cutoff loose enough to admit a real
-# pentamer's ~0.24 is also loose enough to admit some contaminated larger
-# groups (empirically, a group formed from one whole true ring plus part
-# of a neighboring one can land right around CV≈0.3, which "coincidental
-# uniformity" can slip under a single flat threshold but not the
-# pentamer-specific bound below).
-#
-# This margin, added on top of the ideal value, is what a real structure's
-# biological jitter (crystal packing, minor conformational asymmetry — see
-# the module docstring's TOLERANCE section) can be expected to add to CV
-# without indicating contamination. Checked empirically against a jittered
-# synthetic trimer (radius=5, jitter=0.3 — see test_biological_jitter_still_detected):
-# observed CV stayed under 0.05, so 0.08 leaves comfortable headroom.
-RING_SHAPE_CV_JITTER_MARGIN = 0.08
+# Default junction-uniformity gate: the maximum allowed spread (loosest
+# junction distance minus tightest, in Angstroms) within a single
+# candidate ring before it's excluded outright — see find_ring_cycles and
+# the module docstring's JUNCTION UNIFORMITY section. In a genuine C_n
+# ring every consecutive junction is a copy of the SAME physical
+# interface, related by the ring's own rotational symmetry, so their
+# distances should track each other closely; a candidate stitched
+# together from coincidentally-close-but-non-corresponding termini has no
+# such symmetry forcing that agreement. 5.0Å is generous relative to the
+# ~1-2Å of spread ordinary biological jitter (crystal packing, minor
+# conformational asymmetry) produces between genuinely equivalent
+# junctions, while still catching a candidate whose links plainly don't
+# belong to one consistent interface. Set to None to disable this filter
+# entirely and fall back to distance/threshold alone, if it turns out to
+# reject a real ring on a specific structure.
+DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE = 5.0
 
-# Selection floor for detect_ring_size: a candidate ring size only
-# "qualifies" to be preferred by size (see RING SIZE / point-group
-# nesting in the module docstring) if it successfully accounts for at
-# least this fraction of the identity group's chains. Without this floor,
-# a ring size that only manages to explain a small, lucky subset of the
-# group (leaving most chains unassigned) could still out-rank a smaller
-# size that cleanly explains nearly everything, just for being "bigger".
-# 0.75 comfortably allows for a genuine outlier chain or two (see
-# test_leftover_chain_excluded) while still requiring a candidate size to
-# be doing most of the explanatory work before it's trusted over a
-# smaller, fully-covering alternative.
-RING_SIZE_COVERAGE_FLOOR = 0.75
+# Interface-contact sanity check (see the module docstring's INTERFACE
+# CONTACT SANITY CHECK section): two chains linked by an accepted ring
+# junction must show a real, multi-residue interface — not just the one
+# coincidentally-close termini pair that got the junction accepted in the
+# first place. DEFAULT_CONTACT_THRESHOLD, in Angstroms, is the Cα-Cα
+# cutoff for counting a residue PAIR (one from each chain) as "in
+# contact" — 8Å is a standard, generous convention for a Cα-based contact
+# definition (heavy-atom/side-chain contacts sit closer, ~4-5Å, but Cα
+# positions for genuinely interacting residues commonly land out to
+# ~8-10Å). DEFAULT_MIN_CONTACT_PAIRS is how many such pairs must exist
+# between the two chains before they're accepted as a real interface — 1
+# is not enough, since the ring's own junction (the termini pair itself)
+# already guarantees at least that one; requiring MORE than that is what
+# actually distinguishes "these chains have a real interface" from "these
+# two specific CA atoms happen to be close, and nothing else about the
+# chains is." 3 is a light bar — a real, if small, interface footprint —
+# not an attempt to precisely quantify a genuine binding interface's size.
+DEFAULT_CONTACT_THRESHOLD = 8.0
+DEFAULT_MIN_CONTACT_PAIRS = 3
 
 
 def compute_nc_distance(filepath, assembly_id, pair_filter=None):
@@ -184,6 +474,10 @@ def compute_nc_distance(filepath, assembly_id, pair_filter=None):
         optional rather than hardcoded: single-component cages don't need
         it, and the right identity check depends on what data you want to
         compare chains against (sequence, entity ID, etc.).
+
+    This is a deliberately lightweight, single-pair utility — for the
+    primary ring-membership + ring-order pipeline, see analyze_assembly_
+    rings / run_ring_analysis instead.
 
     Returns a dict with assembly_id, the two chain names, and nc_distance
     (in Angstroms, rounded to 2 decimal places) — or None if the structure
@@ -277,19 +571,18 @@ def group_chains_by_sequence(model):
     for the same oligomeric ring.
 
     This is the fix for the two-component cage risk: without this
-    grouping, the two globally closest chain centroids in a two-component
-    assembly could easily be one chain from EACH different component
-    meeting at an interface — a real, close chain pair, but not a valid
-    "these are copies of one subunit" pairing. Grouping by sequence first
-    means a spurious cross-component pair can never even be considered,
-    rather than relying on distance alone and hoping it doesn't happen.
+    grouping, two chains from DIFFERENT components meeting at an interface
+    could in principle still have a directed terminal contact within
+    tau by coincidence — grouping by sequence first means a spurious
+    cross-component pair can never even be considered, rather than relying
+    on the terminal-distance graph alone and hoping it doesn't happen.
 
-    It's also the boundary ring-size auto-detection operates within: each
-    returned group is scored for its own best ring size independently
-    (see detect_ring_size), so a multi-component cage where different
-    proteins form different-sized rings (e.g. one forms trimers, another
-    forms dimers) is handled correctly rather than assuming one size for
-    the whole assembly.
+    It's also the boundary ring detection operates within: each returned
+    group gets its own independent terminal graph and cycle search (see
+    detect_rings), so a multi-component cage where different proteins form
+    different-sized rings (e.g. one forms trimers, another forms dimers)
+    is handled correctly rather than assuming one size — or even one
+    graph — for the whole assembly.
 
     Returns a list of groups, each a list of chain names sharing one
     sequence. Chains with no resolved polymer (already filtered out
@@ -305,464 +598,449 @@ def group_chains_by_sequence(model):
     return list(groups.values())
 
 
-def _pairwise_centroid_matrix(chain_names, chain_geometry):
+def _directed_terminal_matrix(chain_names, chain_geometry):
     """
-    Precomputes the full n x n pairwise centroid-distance matrix for
-    `chain_names` in one vectorized pass. n is the number of chains in one
-    sequence-identity group — at most a few dozen even for the largest
-    icosahedral cages — so this O(n^2) precomputation is always cheap. The
-    point is to make it a ONE-TIME cost: without it, scoring every
-    candidate ring (see _group_combinations_info) would recompute
-    np.linalg.norm for the same chain pair over and over across
-    overlapping candidate groups.
+    Step 2 of the module docstring's algorithm: the full n x n directed
+    terminal-distance matrix for `chain_names`, computed in one vectorized
+    pass. Entry [i, j] is d_term(i -> j) = || C_i - N_j || — chain i's
+    C-terminus to chain j's N-terminus. The diagonal (i == j, a chain's
+    distance to its own termini) is meaningless for a fusion junction and
+    is set to +inf so it can never pass a threshold check.
+
+    This is intentionally NOT symmetric — d_term(i -> j) and d_term(j -> i)
+    are unrelated numbers in general, since a cyclic interface has a
+    direction (see module docstring). Callers that need the reverse
+    direction read matrix[j, i], not matrix[i, j] transposed-and-relabeled.
     """
-    centroids = np.array([chain_geometry[name]["centroid"] for name in chain_names])
-    diffs = centroids[:, None, :] - centroids[None, :, :]
-    return np.linalg.norm(diffs, axis=-1)
+    n = len(chain_names)
+    c_coords = np.array([chain_geometry[name]["c"] for name in chain_names])
+    n_coords = np.array([chain_geometry[name]["n"] for name in chain_names])
+    diffs = c_coords[:, None, :] - n_coords[None, :, :]
+    dist_matrix = np.linalg.norm(diffs, axis=-1)
+    np.fill_diagonal(dist_matrix, np.inf)
+    return dist_matrix
 
 
-def _group_combinations_info(chain_names, dist_matrix, ring_size):
+def build_terminal_graph(chain_names, chain_geometry, threshold=DEFAULT_TERMINAL_THRESHOLD):
     """
-    Scores every possible group of `ring_size` chains from `chain_names`,
-    using the precomputed pairwise-distance matrix from
-    _pairwise_centroid_matrix, and returns them sorted tightest-first by
-    summed pairwise distance.
+    Step 3: builds the directed interface graph G = (V, E) — one node per
+    chain, and a directed edge i -> j wherever d_term(i -> j) <= threshold
+    (see _directed_terminal_matrix). Edge weights carry the actual
+    distance, for downstream tightness scoring (find_ring_cycles).
 
-    Each candidate is a dict with:
-      - "chains"        : the chain-name tuple.
-      - "sum_distance"  : sum of all C(ring_size, 2) pairwise centroid
-                           distances between members. This is the
-                           tightness metric find_best_rings_by_group_distance
-                           has always used for accepting rings of ONE
-                           given size.
-      - "mean_distance" : sum_distance divided by the number of pairs —
-                           the same tightness, normalized so it's
-                           comparable ACROSS different ring sizes (a
-                           tetramer's 6 summed pairwise distances are not
-                           comparable to a trimer's 3 without dividing
-                           out the pair count first). Used by
-                           detect_ring_size for exactly that comparison;
-                           same-size acceptance still goes by
-                           sum_distance, unchanged from before.
-      - "fingerprint"   : sorted tuple of the individual pairwise
-                           distances — a rotation/reflection-invariant
-                           shape descriptor used by
-                           deduplicate_rings_by_geometry to recognize
-                           genuinely equivalent rings.
-      - "cv"            : coefficient of variation (std / mean) of the
-                           pairwise distances — 0.0 when ring_size == 2
-                           (a single distance is trivially "uniform").
-                           This is the shape-uniformity signal used to
-                           reject candidates that mix chains from two
-                           different true rings — see _ideal_ring_shape_cv
-                           and the module docstring's "WHY RAW TIGHTNESS
-                           ALONE FAILS" section for why this check exists
-                           at all.
+    threshold : tau, in Angstroms (see DEFAULT_TERMINAL_THRESHOLD for the
+        default and the reasoning behind it).
 
-    Sorting by sum_distance and by mean_distance agree WITHIN one
-    ring_size, since mean = sum / (a constant, C(ring_size, 2)) — so this
-    one sort order is valid for both find_best_rings_by_group_distance
-    (which uses sum_distance) and detect_ring_size (which uses
-    mean_distance); no separate sort is needed per caller.
+    Returns a networkx.DiGraph with every chain in `chain_names` present
+    as a node even if it ends up with no edges at all (e.g. a chain with
+    no terminus close enough to any other chain's — plausible for a
+    genuinely non-cyclic or monomeric entry in the identity group), so
+    downstream code can always rely on every input chain being a node.
     """
-    index_by_name = {name: i for i, name in enumerate(chain_names)}
-    n_pairs = ring_size * (ring_size - 1) // 2
+    graph = nx.DiGraph()
+    graph.add_nodes_from(chain_names)
+
+    dist_matrix = _directed_terminal_matrix(chain_names, chain_geometry)
+    n = len(chain_names)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d = dist_matrix[i, j]
+            if d <= threshold:
+                graph.add_edge(chain_names[i], chain_names[j], weight=float(d))
+
+    return graph
+
+
+def find_ring_cycles(graph, allowed_sizes=ALLOWED_RING_SIZES,
+                      max_junction_spread=DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE):
+    """
+    Step 4: finds every elementary (simple, non-self-intersecting) directed
+    cycle in `graph` whose length is one of `allowed_sizes`, using
+    networkx's simple_cycles — Johnson's algorithm, bounded by
+    length_bound=max(allowed_sizes) so it never wastes time discovering
+    cycles longer than the longest physically possible ring.
+
+    This is the crux of size-agnosticism: no candidate ring size is ever
+    proposed or tried — a cycle's own length (how many chains it took to
+    close the loop back on itself) directly IS the ring size, for
+    whichever sizes happen to be geometrically present in `graph`, all in
+    one pass.
+
+    max_junction_spread : a candidate cycle is excluded outright if its
+        loosest junction minus its tightest junction exceeds this many
+        Angstroms — see DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE and the
+        module docstring's JUNCTION UNIFORMITY section for the physical
+        reasoning (every junction in a genuine C_n ring is the same
+        interface repeated by symmetry, so their distances should agree
+        with each other, not just each individually clear the
+        terminal_threshold gate). None disables this filter — every
+        elementary cycle found is kept regardless of internal spread,
+        the behavior before this filter existed.
+
+    Each returned candidate is a dict:
+      - "chains"        : tuple of chain names in cyclic fusion order,
+                           e.g. ("A", "B", "C") meaning A -> B -> C -> A.
+      - "edges"          : list of (from_chain, to_chain, nc_distance)
+                            for each consecutive link in the cycle,
+                            including the closing link back to the start.
+      - "ring_size"      : len(chains) — 2/3/4/5, read directly off the
+                            cycle, never assumed going in.
+      - "mean_distance"  : average of the ring_size junction distances —
+                            the tightness metric used to rank and
+                            compare candidates, including candidates of
+                            DIFFERENT sizes (dividing out the link count
+                            is what makes a trimer's 3 links comparable to
+                            a pentamer's 5 — see the old module's
+                            equivalent reasoning for mean vs. sum).
+      - "min_distance"   : the single tightest junction in the ring.
+      - "max_distance"   : the single loosest (weakest) junction in the
+                            ring — useful for flagging rings where the
+                            members aren't all equally well-linked, even
+                            if the ring as a whole is accepted.
+      - "distance_spread": max_distance - min_distance — the uniformity
+                            signal max_junction_spread filters on, kept on
+                            every surviving candidate for inspection even
+                            when the filter is disabled.
+
+    Sorted tightest-first by mean_distance, so callers (in particular
+    _greedy_nonoverlapping_cycles) can walk it in acceptance order
+    directly.
+    """
+    if not allowed_sizes:
+        return []
+
+    max_size = max(allowed_sizes)
+    allowed = set(allowed_sizes)
 
     candidates = []
-    for group in combinations(chain_names, ring_size):
-        idx_pairs = combinations((index_by_name[name] for name in group), 2)
-        pair_distances = [float(dist_matrix[a, b]) for a, b in idx_pairs]
-        total = sum(pair_distances)
-        mean_distance = total / n_pairs
-        if n_pairs > 1 and mean_distance > 0:
-            variance = sum((x - mean_distance) ** 2 for x in pair_distances) / n_pairs
-            cv = (variance ** 0.5) / mean_distance
-        else:
-            cv = 0.0
+    for cycle in nx.simple_cycles(graph, length_bound=max_size):
+        size = len(cycle)
+        if size not in allowed:
+            continue
+
+        edges = []
+        for k in range(size):
+            a, b = cycle[k], cycle[(k + 1) % size]
+            edges.append((a, b, graph[a][b]["weight"]))
+
+        distances = [e[2] for e in edges]
+        min_distance = min(distances)
+        max_distance = max(distances)
+        spread = max_distance - min_distance
+
+        if max_junction_spread is not None and spread > max_junction_spread:
+            continue
+
         candidates.append({
-            "chains": group,
-            "sum_distance": total,
-            "mean_distance": mean_distance,
-            "fingerprint": tuple(sorted(pair_distances)),
-            "cv": cv,
+            "chains": tuple(cycle),
+            "edges": edges,
+            "ring_size": size,
+            "mean_distance": sum(distances) / size,
+            "min_distance": min_distance,
+            "max_distance": max_distance,
+            "distance_spread": spread,
         })
 
-    candidates.sort(key=lambda c: c["sum_distance"])
+    candidates.sort(key=lambda c: c["mean_distance"])
     return candidates
 
 
-def _ideal_ring_shape_cv(ring_size):
+def _has_ca_coords(chain_names, chain_geometry):
     """
-    The coefficient of variation (CV) of the pairwise distances between
-    `ring_size` points evenly spaced on a circle — i.e. what a perfectly
-    regular, unjittered n-gon's own shape-uniformity CV works out to.
-    Used as the baseline for _filter_uniform_shape's per-size threshold
-    (see RING_SHAPE_CV_JITTER_MARGIN): 0.0 for ring_size 2 or 3 (a dimer
-    has one pairwise distance; an equilateral triangle's three edges are
-    exactly equal), ≈0.1716 for 4, ≈0.2361 for 5. Scale-invariant (the
-    circle's radius cancels out of a ratio of distances), so this needs
-    no chain geometry to compute — it's pure polygon math.
+    True if every chain in `chain_names` has a "ca_coords" entry in
+    chain_geometry — the full per-residue CA trace termini.
+    get_chain_ca_geometry started returning alongside n/c/centroid/
+    n_vector/c_vector, specifically so the interface-contact sanity check
+    below (_interchain_contact_count / _filter_has_interface_contact)
+    doesn't need to re-parse the structure. False if chain_geometry was
+    built by an older termini.py that predates that field — callers use
+    this to skip the contact check gracefully (with an explanation)
+    rather than crashing on a missing key.
     """
-    from math import sin, pi
-    distances = []
-    for i in range(ring_size):
-        for j in range(i + 1, ring_size):
-            angle = 2 * pi * abs(i - j) / ring_size
-            # chord length between two points on a unit circle separated
-            # by `angle` radians.
-            distances.append(2 * sin(angle / 2) if angle <= pi else 2 * sin((2 * pi - angle) / 2))
-    mean = sum(distances) / len(distances)
-    if mean == 0:
-        return 0.0
-    variance = sum((x - mean) ** 2 for x in distances) / len(distances)
-    return (variance ** 0.5) / mean
+    return all(chain_geometry.get(name, {}).get("ca_coords") is not None for name in chain_names)
 
 
-def _filter_uniform_shape(candidates, ring_size, max_cv=None):
+def _interchain_contact_count(chain_a, chain_b, chain_geometry, contact_threshold):
     """
-    Drops any candidate whose shape-uniformity CV exceeds the allowed
-    threshold for `ring_size` — see RING_SHAPE_CV_JITTER_MARGIN and
-    _ideal_ring_shape_cv.
+    Counts how many (residue_in_chain_a, residue_in_chain_b) CA-CA pairs
+    fall within `contact_threshold` Angstroms of each other — the full
+    per-residue interface footprint between two chains, not just their
+    single closest approach.
 
-    max_cv : None (default) — use the size-specific threshold
-        (_ideal_ring_shape_cv(ring_size) + RING_SHAPE_CV_JITTER_MARGIN),
-        the recommended setting. A number — override with one flat
-        threshold applied regardless of ring_size. float("inf") —
-        disable the filter entirely (every candidate passes through
-        unchanged).
+    This is deliberately a COUNT, not a minimum distance. A minimum
+    inter-chain CA-CA distance is not a useful signal here: the two
+    chains being checked are exactly the two chains an accepted ring
+    junction already links, and that junction's own from_chain C-terminus
+    / to_chain N-terminus ARE two of the CA atoms being compared — so the
+    minimum is already guaranteed to be at most the junction distance
+    that got the ring accepted in the first place. A minimum-distance
+    check could never fail for an accepted ring; it would be pure
+    overhead with no discriminating power. Counting how many INDEPENDENT
+    residue pairs are close, by contrast, can't be satisfied by that one
+    already-known-close termini pair alone — see _filter_has_interface_
+    contact and DEFAULT_MIN_CONTACT_PAIRS.
 
-    This runs BEFORE greedy acceptance in both find_best_rings_by_group_distance
-    and detect_ring_size, so a contaminated candidate (one mixing chains
-    from two different true rings) can never win a slot away from a
-    genuine one just because its raw distance happens to be tighter — see
-    the module docstring for a worked example of exactly this happening.
+    Vectorized over the full (n_a, 3) x (n_b, 3) coordinate arrays — cheap
+    for typical chain lengths, and only ever run on the handful of
+    candidate rings that already survived the terminal-threshold and
+    junction-uniformity filters, not on every possible chain pair.
     """
-    threshold = (
-        _ideal_ring_shape_cv(ring_size) + RING_SHAPE_CV_JITTER_MARGIN
-        if max_cv is None else max_cv
-    )
-    return [c for c in candidates if c["cv"] <= threshold]
+    coords_a = chain_geometry[chain_a]["ca_coords"]
+    coords_b = chain_geometry[chain_b]["ca_coords"]
+    diffs = coords_a[:, None, :] - coords_b[None, :, :]
+    dists = np.linalg.norm(diffs, axis=-1)
+    return int(np.count_nonzero(dists <= contact_threshold))
 
 
-def _greedy_nonoverlapping_accept(candidates, tolerance, score_key):
+def _filter_has_interface_contact(candidates, chain_geometry, contact_threshold, min_contact_pairs):
     """
-    Walks `candidates` (already sorted tightest-first by score_key) and
-    greedily accepts non-overlapping groups: the first accepted
-    candidate's score sets the quality bar ("anchor"), and any later
-    candidate whose score exceeds anchor + tolerance stops the search
-    entirely — since candidates are sorted tightest-first, every
-    remaining one is at least as loose and would fail the cutoff too.
+    Drops any candidate cycle where at least one of its own junctions'
+    two chains fail to show a real, multi-residue interface (see
+    _interchain_contact_count) — the mitigation for the failure mode
+    observed on 1WPB-2 (long, winding chains whose termini can reach
+    across to a chain they don't actually pack against anywhere else).
+
+    Every consecutive pair in the cycle (the same pairs the ring's own
+    junctions already connect) is checked independently — not every
+    pairwise combination of ring members — since those are exactly the
+    pairs the cycle is claiming are genuine ring-mates; a tetramer or
+    pentamer's non-adjacent ("diagonal") members are never required to
+    directly contact each other.
+
+    A candidate that survives has its per-edge contact counts stashed
+    under "min_contact_pairs_found" (the smallest count across its
+    junctions) so _cycle_to_ring_result can surface it on the final ring
+    result without recomputing it against a possibly different threshold
+    later.
+
+    contact_threshold / min_contact_pairs : either being None disables
+    this filter entirely (every candidate passes through unchanged) — see
+    DEFAULT_CONTACT_THRESHOLD / DEFAULT_MIN_CONTACT_PAIRS.
+    """
+    if contact_threshold is None or min_contact_pairs is None:
+        return candidates
+
+    kept = []
+    for candidate in candidates:
+        counts = [
+            _interchain_contact_count(a, b, chain_geometry, contact_threshold)
+            for a, b, _ in candidate["edges"]
+        ]
+        if min(counts) >= min_contact_pairs:
+            candidate["min_contact_pairs_found"] = min(counts)
+            kept.append(candidate)
+    return kept
+
+
+def _greedy_nonoverlapping_cycles(cycles):
+    """
+    Step 5: walks `cycles` (already sorted tightest-first by
+    mean_distance — see find_ring_cycles) and accepts EVERY candidate
+    that doesn't reuse a chain an earlier (and therefore tighter-or-equal)
+    accepted candidate already claimed. That is the entire rule — there is
+    no additional "stop once things get too much looser than the first
+    ring found" cutoff (see the module docstring's BUGFIX section for why
+    an earlier version of this had exactly that cutoff, and why it was
+    actively wrong: it conflated ordinary between-ring tightness variation
+    in a real structure with genuine noise, and could silently drop a
+    real, fully disjoint ring for no reason other than being found later
+    in a looser part of the sorted list).
 
     Assignment is greedy, not globally optimal: each candidate is only
-    checked against chains already claimed by a PREVIOUSLY accepted
-    (and therefore tighter-or-equal) candidate, so a genuine ring gets
-    first claim on its own chains before a worse grouping has a chance to
-    steal one of them.
+    checked against chains already claimed by a PREVIOUSLY accepted (and
+    therefore tighter-or-equal) candidate, so a genuine, tight ring gets
+    first claim on its own chains before a looser, overlapping alternative
+    has a chance to steal one of them.
 
-    Quality cutoff, in words: without the anchor+tolerance stop, greedy
-    assignment would happily keep going after the real rings are claimed,
-    forcing leftover chains into additional "rings" no matter how loose.
-    Chains that don't end up in any group within tolerance of the
-    tightest one are left unassigned rather than forced into a bad one —
-    that's the correct outcome when those chains genuinely aren't part of
-    an equivalent ring (extra copies in the asymmetric unit, mismatched
-    leftovers, a genuinely asymmetric arrangement), not a bug.
+    Called once PER CANDIDATE RING SIZE by detect_rings — this only
+    resolves overlap WITHIN that one size's own candidates. Whether that
+    size's result is trustworthy at all (does it account for every chain
+    in the group, with none left over?) is detect_rings' job, not this
+    one's — see the module docstring's TOTAL-COVERAGE AXIS SELECTION
+    section.
 
-    score_key : "sum_distance" (same-size acceptance, e.g. inside
-        find_best_rings_by_group_distance) or "mean_distance" (cross-size
-        comparison, inside detect_ring_size) — see _group_combinations_info
-        for why these differ and when each applies.
-
-    Returns the accepted candidate dicts, in the same shape they came in.
+    Returns the accepted candidate dicts (in the same shape they came
+    in) — every candidate that did NOT share a chain with an
+    already-accepted one.
     """
     assigned = set()
     accepted = []
-    anchor_score = None
 
-    for candidate in candidates:
+    for candidate in cycles:
         chains = candidate["chains"]
-        if not assigned.isdisjoint(chains):
-            continue
-        score = candidate[score_key]
-        if anchor_score is None:
-            anchor_score = score
-        elif score - anchor_score > tolerance:
-            break
-        accepted.append(candidate)
-        assigned.update(chains)
+        if assigned.isdisjoint(chains):
+            accepted.append(candidate)
+            assigned.update(chains)
 
     return accepted
 
 
-def find_best_rings_by_group_distance(chain_names, chain_geometry, ring_size, tolerance=1.5, max_combinations=MAX_RING_CANDIDATE_COMBINATIONS, max_shape_cv=None):
+def detect_rings(chain_names, chain_geometry, ring_size=None, candidate_ring_sizes=ALLOWED_RING_SIZES,
+                  terminal_threshold=DEFAULT_TERMINAL_THRESHOLD,
+                  max_junction_spread=DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE,
+                  contact_threshold=DEFAULT_CONTACT_THRESHOLD, min_contact_pairs=DEFAULT_MIN_CONTACT_PAIRS):
     """
-    Directly evaluates EVERY possible group of `ring_size` chains within
-    one same-sequence identity group, discards any whose internal shape
-    isn't uniform enough to plausibly be a real ring (see max_shape_cv /
-    _ideal_ring_shape_cv and the module docstring), scores what's left by
-    how tightly packed its members are (summed pairwise centroid
-    distance), and greedily keeps the tightest non-overlapping groups
-    first — see _greedy_nonoverlapping_accept for the acceptance rule.
+    Auto-detects every ring findable within one sequence-identity group of
+    chains, via the directed-terminal-cycle method (see module docstring):
+    build the directed C-to-N interface graph, find every elementary
+    cycle whose length is a physically allowed ring size AND whose own
+    junction distances are internally consistent (max_junction_spread —
+    see JUNCTION UNIFORMITY) AND whose linked chains show a real
+    multi-residue interface (contact_threshold / min_contact_pairs — see
+    INTERFACE CONTACT SANITY CHECK).
 
-    This is deliberately a direct group-scoring approach rather than
-    seeding a cluster from the single globally closest PAIR and growing it
-    outward: the globally closest pair can belong to two DIFFERENT
-    physical rings that happen to sit near each other (same sequence,
-    same cage, just neighboring rings) rather than being genuine
-    ring-mates. Scoring whole candidate groups directly avoids that — a
-    candidate is only accepted by comparing it against every OTHER
-    possible group, not by trusting one pairwise distance as a stand-in
-    for ring membership.
+    When auto-detecting (ring_size=None), EVERY size in candidate_ring_
+    sizes is tried independently against the WHOLE group: for each size,
+    the tightest-first non-overlapping candidates (_greedy_nonoverlapping_
+    cycles) are accepted, and that size's result is kept ONLY IF it
+    accounts for every single chain in the group — no residue left over.
+    A size that leaves even one chain uncovered is discarded ENTIRELY for
+    this group (not partially reported). See the module docstring's
+    TOTAL-COVERAGE AXIS SELECTION section for the full reasoning: a real,
+    designed cyclic subunit's own symmetry axis has to account for the
+    WHOLE identity group by definition (every copy of it), while a size
+    that only explains SOME of the chains is either the wrong size, or
+    reading a coincidental (non-ring-forming) contact as if it were one.
 
-    ring_size must be one of ALLOWED_RING_SIZES (2/3/4/5) — see that
-    constant and the module docstring for why no other size is physically
-    possible for a Platonic-solid-type cage.
+    Because a real T/O/I point-group cage genuinely CAN have more than
+    one size simultaneously achieve total coverage of the same group
+    (e.g. an octahedral cage's own 2-fold axes, relating chains across
+    different trimers, alongside its 3-fold axis within each trimer —
+    both are real, both can independently partition every chain), this
+    function does NOT pick a single winning size when auto-detecting. It
+    returns the UNION of every candidate size that achieves total
+    coverage, each candidate still tagged with its own "ring_size" — the
+    caller (or a human) decides which axis is the biologically intended
+    subunit, e.g. against a trusted oligomeric_count from metadata.
 
-    This deliberately doesn't hardcode an expected ring COUNT (e.g. 4 for
-    a tetrahedral cage) — that number falls out naturally once tightness
-    is bounded correctly: a tetrahedral assembly's 4 trimers are all real
-    and comparably tight, so all 4 pass the cutoff together.
+    ring_size : if given, restricts to cycles of exactly this size (must
+        be one of ALLOWED_RING_SIZES) and skips the total-coverage
+        requirement entirely — every surviving candidate of that size is
+        accepted tightest-first, same as before, and leftover chains are
+        fine (e.g. genuine crystallographic extras). This remains the
+        SAFEST option whenever you already trust the subunit's oligomeric
+        state (e.g. oligomeric_count / stoichiometry via query.py's
+        fetch_metadata()), since it sidesteps the multi-axis ambiguity
+        above entirely rather than resolving it structurally.
+        None (default) auto-detects across candidate_ring_sizes.
+    candidate_ring_sizes : which sizes may be considered when ring_size is
+        None (default ALLOWED_RING_SIZES).
+    terminal_threshold : tau, passed to build_terminal_graph — see
+        DEFAULT_TERMINAL_THRESHOLD.
+    max_junction_spread : passed to find_ring_cycles — see
+        DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE. Set to None to disable
+        this filter and accept any cycle within terminal_threshold
+        regardless of how much its own junction distances vary.
+    contact_threshold, min_contact_pairs : the interface-contact sanity
+        check (see _filter_has_interface_contact and the module
+        docstring's INTERFACE CONTACT SANITY CHECK section) — every
+        candidate's own junctions must show at least min_contact_pairs
+        independent CA-CA pairs within contact_threshold Å between the
+        two chains, beyond the one termini pair that got the junction
+        candidate in the first place. Either being None disables this
+        check. Silently skipped (with a printed note) if chain_geometry
+        lacks the "ca_coords" field this check needs — see termini.
+        get_chain_ca_geometry.
 
-    max_combinations : if C(len(chain_names), ring_size) exceeds this,
-        the search is skipped (a warning is printed, and an empty list is
-        returned) rather than silently taking a long time — see
-        MAX_RING_CANDIDATE_COMBINATIONS. Raise it explicitly if you have a
-        specific, known-large case that genuinely needs it.
+    Returns a flat list of accepted ring-cycle dicts (see
+    find_ring_cycles) — possibly of MIXED ring_size when auto-detecting
+    (see above; check each candidate's own "ring_size" field to tell them
+    apart). Pass each to _cycle_to_ring_result for the fully annotated,
+    DataFrame-ready form, or just use analyze_assembly_rings, which does
+    this for you.
 
-    max_shape_cv : candidates whose internal pairwise distances are less
-        uniform than allowed are excluded before tightness ranking even
-        happens — this is what stops a group that accidentally mixes
-        chains from two different true rings from winning a slot just
-        because it happens to be numerically tighter. None (default) uses
-        a size-specific threshold derived from the ideal n-gon's own CV
-        plus a small jitter allowance (see _ideal_ring_shape_cv /
-        RING_SHAPE_CV_JITTER_MARGIN) — the recommended setting. Pass a
-        number to override with one flat threshold, or float("inf") to
-        disable this filter entirely.
-
-    Returns a list of chain-name groups (each of length ring_size).
-    Chains left out (by the overlap rule, the tolerance cutoff, the
-    shape-uniformity filter, or a skipped oversized search) are excluded
-    entirely rather than padded.
+    Returns [] if the group has too few chains, if no cycle at all
+    survived every filter, or (when auto-detecting) if NO candidate size
+    managed to account for every chain in the group — see the printed
+    per-size summary for which sizes were found but discarded, and why
+    (also see the module docstring's LIMITATIONS section: a genuinely
+    correct size that's merely under-detected by a chain or two is
+    discarded the same as a genuinely wrong one under this rule).
     """
-    if ring_size not in ALLOWED_RING_SIZES:
-        raise ValueError(
-            f"ring_size must be one of {ALLOWED_RING_SIZES} — Platonic-solid "
-            f"(T/O/I point-group) cages only have 2-, 3-, 4-, and 5-fold "
-            f"rotational symmetry axes, so no other ring size is physically "
-            f"possible — got {ring_size}"
-        )
-    if len(chain_names) < ring_size:
-        return []
-
-    n_combinations = comb(len(chain_names), ring_size)
-    if n_combinations > max_combinations:
-        print(
-            f"find_best_rings_by_group_distance: skipping ring_size={ring_size} "
-            f"for {len(chain_names)} chains ({n_combinations} candidate groups "
-            f"exceeds max_combinations={max_combinations})."
-        )
-        return []
-
-    dist_matrix = _pairwise_centroid_matrix(chain_names, chain_geometry)
-    candidates = _group_combinations_info(chain_names, dist_matrix, ring_size)
-    candidates = _filter_uniform_shape(candidates, ring_size, max_shape_cv)
-    accepted = _greedy_nonoverlapping_accept(candidates, tolerance, score_key="sum_distance")
-
-    return [list(c["chains"]) for c in accepted]
-
-
-def _ring_isolation_ratio(ring_chains, chain_names, dist_matrix, intra_mean_distance):
-    """
-    How much farther this ring's nearest chain OUTSIDE it sits, relative
-    to how tight the ring itself is. Retained as a diagnostic value
-    surfaced in detect_ring_size's informational output — NOT used to
-    accept or reject a candidate size (see below for why).
-
-    An earlier version of this module used isolation ratio as a hard
-    selection criterion, on the theory that a genuine ring should sit
-    clearly apart from everything outside it. That's true for ONE failure
-    mode — an even ring size (a tetramer, most notably) can always be cut
-    into tight, fully-covering smaller groups using just its
-    adjacent-neighbor contacts, and the chains "left out" of each such
-    fake group are the true ring's OTHER members, sitting almost as close
-    as the fake group's own chains, so isolation ratio correctly flags
-    that as suspicious. But it actively gets a SECOND, equally real case
-    wrong: a genuine, separate, internally-uniform ring (e.g. one trimer
-    in an octahedral cage of 8) whose neighboring ring just happens to
-    sit close by, because the cage's own inter-subunit ("cage-forming")
-    contact is tighter than the ring's internal ("oligomerization")
-    contact — a normal, expected feature of efficient cage packing, not a
-    sign that the trimer is spurious. Isolation ratio can't tell these
-    two cases apart, because both produce "something close was left out".
-    What actually distinguishes them is shape uniformity (see
-    _ideal_ring_shape_cv / _filter_uniform_shape) plus preferring the
-    larger of two otherwise-valid ring sizes (see detect_ring_size) —
-    isolation ratio itself is kept only as a number worth glancing at,
-    not a gate.
-
-    Returns +inf if every other chain in `chain_names` is already inside
-    `ring_chains` (nothing left to compare against — the whole identity
-    group IS this one ring) — maximally isolated by definition.
-    """
-    index_by_name = {name: i for i, name in enumerate(chain_names)}
-    ring_idx = {index_by_name[c] for c in ring_chains}
-    outside_idx = [i for i in range(len(chain_names)) if i not in ring_idx]
-    if not outside_idx:
-        return float("inf")
-    gap = min(dist_matrix[i, j] for i in ring_idx for j in outside_idx)
-    return gap / intra_mean_distance if intra_mean_distance > 0 else float("inf")
-
-
-def detect_ring_size(chain_names, chain_geometry, candidate_sizes=ALLOWED_RING_SIZES, tolerance=1.5, max_combinations=MAX_RING_CANDIDATE_COMBINATIONS, max_shape_cv=None, min_coverage=RING_SIZE_COVERAGE_FLOOR):
-    """
-    Auto-detects which ring size best explains one sequence-identity
-    group's chains — "Challenge 1": recognizing how many chains belong in
-    a ring, from geometry alone, rather than requiring it as an input.
-
-    For each candidate size (restricted to ALLOWED_RING_SIZES — 2/3/4/5,
-    the only rotational symmetry orders a Platonic-solid-type cage can
-    have), every possible group of that size is scored, filtered by
-    shape uniformity (max_shape_cv — see _ideal_ring_shape_cv and the
-    module docstring's "WHY RAW TIGHTNESS ALONE FAILS" section), and
-    greedily assigned into non-overlapping rings using the same machinery
-    find_best_rings_by_group_distance uses, except tightness here is
-    judged by MEAN pairwise centroid distance rather than the summed
-    distance. That normalization is what makes different sizes
-    comparable at all — a tetramer's 6 pairwise distances will always sum
-    to more than a trimer's 3, even if the tetramer is individually
-    tighter — and it's what lets `tolerance` mean the same physical thing
-    (Angstroms of acceptable centroid-distance variation between
-    equivalent copies) no matter which size is being evaluated.
-
-    A candidate size is skipped (with a printed warning) if the identity
-    group has fewer chains than that size, or if C(n, size) exceeds
-    max_combinations — see that parameter and MAX_RING_CANDIDATE_COMBINATIONS.
-
-    Selection: think of it the way you'd check a partition by hand — for
-    a well-formed identity group, the CORRECT ring size is the one where
-    sorting the chains into same-size, non-overlapping, shape-uniform
-    groups leaves no overlap and (ideally) no residual chains: every
-    chain assigned to exactly one group. So COVERAGE (the fraction of the
-    group's chains successfully assigned) is the primary criterion,
-    across every candidate size — not a pass/fail floor gate for a
-    separate "which is biggest" competition. The size with the highest
-    coverage wins outright.
-
-    Point-group nesting only comes in as a TIE-BREAKER: if two sizes
-    cover the exact same number of chains (a real tie, not just close),
-    the larger one wins, since a higher-order rotational symmetry axis,
-    when genuinely present, mathematically implies/contains whatever
-    lower-order proximities (a 2-fold "dimer"-looking contact between
-    neighboring trimers) show up alongside it — never the reverse. This
-    is what correctly prefers 8 trimers over 12 dimers when both happen
-    to cleanly, fully partition the same chains. But it must never
-    override a size that explains MORE of the structure: 4 trimers with
-    perfect 12/12 coverage beats a spurious 2-pentamer reading that only
-    manages 10/12, even though 5 > 3 — a size that leaves real chains
-    unassigned isn't "more advanced" symmetry, it's just a worse fit,
-    and coverage is what has to decide that, not size.
-
-    min_coverage (default RING_SIZE_COVERAGE_FLOOR) plays a much smaller
-    role now: it's a confidence check on the WINNER, not a competition
-    gate — if even the best-covering size falls short of it, a warning is
-    printed (this group might be a mix of unrelated chains, or `tolerance`
-    /`max_shape_cv` may need widening) but the best available fit is still
-    returned rather than nothing.
-
-    Returns (winning_size, accepted_rings) — accepted_rings is that
-    size's list of chain-name-group lists, exactly like
-    find_best_rings_by_group_distance would return for that size, so the
-    caller never has to recompute it. Returns (None, []) if no candidate
-    size assigned even a single valid ring.
-    """
-    invalid = sorted(set(candidate_sizes) - set(ALLOWED_RING_SIZES))
+    sizes = (ring_size,) if ring_size is not None else tuple(candidate_ring_sizes)
+    invalid = sorted(set(sizes) - set(ALLOWED_RING_SIZES))
     if invalid:
         raise ValueError(
-            f"candidate_sizes can only include {ALLOWED_RING_SIZES} — "
-            f"Platonic-solid (T/O/I point-group) cages only have 2-, 3-, "
-            f"4-, and 5-fold rotational symmetry axes — got invalid size(s) {invalid}"
+            f"ring size(s) must be one of {ALLOWED_RING_SIZES} — Platonic-solid "
+            f"(T/O/I point-group) cages only have 2-, 3-, 4-, and 5-fold "
+            f"rotational symmetry axes, so no other ring size is physically "
+            f"possible — got invalid size(s) {invalid}"
         )
 
-    n = len(chain_names)
-    results = []  # (size, coverage, mean_tightness, min_isolation_ratio, accepted_candidates)
+    if len(chain_names) < min(sizes):
+        return []
 
-    for size in sorted(candidate_sizes):
-        if size > n:
-            continue
+    graph = build_terminal_graph(chain_names, chain_geometry, threshold=terminal_threshold)
+    cycles = find_ring_cycles(graph, allowed_sizes=sizes, max_junction_spread=max_junction_spread)
 
-        n_combinations = comb(n, size)
-        if n_combinations > max_combinations:
+    if contact_threshold is not None and min_contact_pairs is not None:
+        if _has_ca_coords(chain_names, chain_geometry):
+            cycles = _filter_has_interface_contact(cycles, chain_geometry, contact_threshold, min_contact_pairs)
+        else:
             print(
-                f"detect_ring_size: skipping ring_size={size} for {n} chains "
-                f"({n_combinations} candidate groups exceeds max_combinations={max_combinations})."
-            )
-            continue
-
-        dist_matrix = _pairwise_centroid_matrix(chain_names, chain_geometry)
-        candidates = _group_combinations_info(chain_names, dist_matrix, size)
-        candidates = _filter_uniform_shape(candidates, size, max_shape_cv)
-        accepted = _greedy_nonoverlapping_accept(candidates, tolerance, score_key="mean_distance")
-
-        if not accepted:
-            continue
-
-        coverage = (len(accepted) * size) / n
-        mean_tightness = sum(c["mean_distance"] for c in accepted) / len(accepted)
-        # diagnostic only (see _ring_isolation_ratio) — not used to decide anything below.
-        min_isolation_ratio = min(
-            _ring_isolation_ratio(c["chains"], chain_names, dist_matrix, c["mean_distance"])
-            for c in accepted
-        )
-        results.append((size, coverage, mean_tightness, min_isolation_ratio, accepted))
-
-    if not results:
-        return None, []
-
-    # Coverage decides first, across ALL viable sizes — not just ones
-    # clearing min_coverage. Ties (same number of chains covered) are
-    # broken by preferring the larger size (point-group nesting); a
-    # further tie by tightness. Sizes covering strictly fewer chains
-    # never win just for being bigger — see the docstring above.
-    results.sort(key=lambda r: (-r[1], -r[0], r[2]))
-    winner = results[0]
-    winning_size, winning_coverage, winning_tightness, _, accepted_candidates = winner
-
-    if len(results) > 1:
-        runner_up = results[1]
-        coverage_tied = abs(winner[1] - runner_up[1]) < 1e-9
-        if coverage_tied:
-            print(
-                f"detect_ring_size: ring_size={winning_size} and ring_size={runner_up[0]} "
-                f"both cover the same {round(winning_coverage * n)} of {n} chains "
-                f"(coverage={winning_coverage:.2f}) — choosing the larger per point-group "
-                f"nesting (a higher-order symmetry axis's rings account for the lower-order "
-                f"ones as a byproduct, not the reverse). Consider cross-checking against "
-                f"known oligomeric-state metadata if ring_size={winning_size} looks wrong."
+                "detect_rings: chain_geometry has no 'ca_coords' field (built by a "
+                "termini.py older than the interface-contact sanity check) — skipping "
+                "that check for this group. Update termini.get_chain_ca_geometry to "
+                "enable it, or pass contact_threshold=None to silence this message."
             )
 
-    if winning_coverage < min_coverage:
-        print(
-            f"detect_ring_size: best fit is ring_size={winning_size}, but it only covers "
-            f"{winning_coverage:.0%} of this group of {n} chains (below the "
-            f"{min_coverage:.0%} confidence floor) — consider widening tolerance or "
-            f"max_shape_cv, or checking this group isn't a mix of unrelated chains."
-        )
+    if not cycles:
+        return []
 
-    return winning_size, [list(c["chains"]) for c in accepted_candidates]
+    if ring_size is not None:
+        # Explicit size: no total-coverage requirement, no competition
+        # against other sizes — accept tightest-first, same as before.
+        return _greedy_nonoverlapping_cycles(cycles)
+
+    # Auto-detect: run EACH candidate size's own non-overlapping
+    # acceptance independently against the WHOLE group, and keep a
+    # size's result only if it leaves no chain uncovered — see this
+    # function's docstring and the module docstring's TOTAL-COVERAGE
+    # AXIS SELECTION section. Sizes are reported side by side, not
+    # competed against each other: more than one can genuinely be a
+    # real, total symmetry axis of the same assembly at once.
+    n_chains = len(chain_names)
+    by_size = {}
+    for c in cycles:
+        by_size.setdefault(c["ring_size"], []).append(c)
+
+    all_accepted = []
+    summary = []
+    for size in sorted(by_size):
+        accepted_s = _greedy_nonoverlapping_cycles(by_size[size])
+        covered = {chain for cyc in accepted_s for chain in cyc["chains"]}
+        if len(covered) == n_chains:
+            all_accepted.extend(accepted_s)
+            summary.append(f"size={size}: VALID — {len(accepted_s)} ring(s), covers all {n_chains} chains")
+        else:
+            summary.append(
+                f"size={size}: discarded — {len(accepted_s)} ring(s) found but "
+                f"{n_chains - len(covered)} of {n_chains} chains left uncovered "
+                f"(not a total symmetry axis for this group)"
+            )
+
+    print(f"detect_rings: per-size axis check for this {n_chains}-chain group — " + "; ".join(summary))
+
+    return all_accepted
 
 
 def find_shortest_ring_junction(ring_chain_names, chain_geometry):
     """
-    Given the chain names in one validated ring, finds the SHORTEST single
-    N-to-C junction distance between any two DIFFERENT chains in that ring.
+    Given the chain names in one ring (from whatever source — detect_rings,
+    or already known some other way, e.g. trusted metadata), finds the
+    SHORTEST single N-to-C junction distance between any two DIFFERENT
+    chains in that ring, by brute-force checking every ordered pair.
 
-    This is NC distance as originally defined: one number, one specific
-    junction — not a summed path across the whole ring. Checks every
-    ordered pair within the ring (chain A's C-terminus to chain B's
-    N-terminus, for every A != B) and keeps the minimum. Ring size is
-    small (at most 5 — see ALLOWED_RING_SIZES), so a direct comparison is
-    cheap.
+    This is kept as a standalone utility for the case where you already
+    have ring MEMBERSHIP from elsewhere and just want its best candidate
+    fusion pair, without needing to know or trust any particular chain
+    ORDER. The primary pipeline (analyze_assembly_rings) doesn't need
+    this brute-force scan — detect_rings' cycles already carry the true,
+    directed fusion order for every consecutive pair, which is strictly
+    more informative — but this remains useful on its own, e.g. against a
+    ring membership list sourced from metadata rather than geometry.
 
     Also computes and attaches this ring's "fingerprint" — the sorted
     tuple of every pairwise centroid distance between its members — and
@@ -797,6 +1075,86 @@ def find_shortest_ring_junction(ring_chain_names, chain_geometry):
     return best
 
 
+def _cycle_to_ring_result(cycle, chain_geometry):
+    """
+    Converts one accepted cycle (from detect_rings / find_ring_cycles)
+    into the fully annotated ring-result dict analyze_assembly_rings
+    returns, carrying strictly more information than the old module's
+    find_shortest_ring_junction-based result did — the whole ordered
+    fusion path is known now, not just its single tightest link.
+
+    Fields:
+      - chain_order  : chains in cyclic fusion order (cycle["chains"]).
+      - ring_size    : as detected — len(chain_order).
+      - junctions    : every consecutive directed link in the ring, in
+                        order, as {"from_chain", "to_chain", "nc_distance"}
+                        dicts — the complete fusion path, including the
+                        closing link back to the first chain.
+      - from_chain, to_chain, nc_distance : the single TIGHTEST junction
+                        in the ring, kept at the top level for backward
+                        compatibility with consumers (e.g.
+                        orientation.annotate_ring_orientation) built
+                        around "one representative junction per ring",
+                        and because it's still a reasonable answer to
+                        "what's this ring's best/most confident single
+                        fusion candidate".
+      - mean_nc_distance, weakest_junction_distance : overall ring
+                        tightness, and its single loosest link — useful
+                        for flagging a ring where fusion may be uneven
+                        across its junctions even though the ring as a
+                        whole was accepted.
+      - junction_spread : weakest_junction_distance minus this ring's
+                        tightest junction (nc_distance) — the same
+                        uniformity signal find_ring_cycles' max_junction_
+                        spread filters candidates on (see the module
+                        docstring's JUNCTION UNIFORMITY section), kept
+                        here so a surviving ring's own consistency is
+                        still visible even when the filter passed it (or
+                        was disabled).
+      - min_contact_pairs : the fewest independent CA-CA contact pairs
+                        (see _interchain_contact_count) found across this
+                        ring's own junctions, when the interface-contact
+                        sanity check ran (see detect_rings' contact_
+                        threshold / min_contact_pairs) — None if that
+                        check was disabled or skipped (e.g. chain_geometry
+                        has no "ca_coords"). Every accepted ring already
+                        cleared min_contact_pairs when the check ran; this
+                        is how much margin it had, not a pass/fail flag.
+      - fingerprint  : sorted tuple of pairwise centroid distances between
+                        members — unchanged in meaning from before, still
+                        what deduplicate_rings_by_geometry compares to
+                        recognize physically equivalent rings. Present on
+                        this dict for that comparison to use, but
+                        analyze_assembly_rings drops it from its returned
+                        rings once deduplication is done — it's an
+                        internal comparison key, not user-facing output.
+    """
+    edges = cycle["edges"]
+    tightest = min(edges, key=lambda e: e[2])
+    weakest = max(edges, key=lambda e: e[2])
+    chain_order = list(cycle["chains"])
+
+    return {
+        "chain_order": chain_order,
+        "ring_size": cycle["ring_size"],
+        "junctions": [
+            {"from_chain": a, "to_chain": b, "nc_distance": round(d, 2)}
+            for a, b, d in edges
+        ],
+        "from_chain": tightest[0],
+        "to_chain": tightest[1],
+        "nc_distance": round(tightest[2], 2),
+        "mean_nc_distance": round(cycle["mean_distance"], 2),
+        "weakest_junction_distance": round(weakest[2], 2),
+        "junction_spread": round(weakest[2] - tightest[2], 2),
+        "min_contact_pairs": cycle.get("min_contact_pairs_found"),
+        "fingerprint": tuple(sorted(
+            float(np.linalg.norm(chain_geometry[a]["centroid"] - chain_geometry[b]["centroid"]))
+            for a, b in combinations(chain_order, 2)
+        )),
+    }
+
+
 def deduplicate_rings_by_geometry(rings, tolerance=1.5):
     """
     Collapses rings that are the SAME physical ring — related by the
@@ -807,11 +1165,11 @@ def deduplicate_rings_by_geometry(rings, tolerance=1.5):
     merge two DIFFERENT rings that happen to look similar by one number.
 
     Equivalence is judged by comparing each ring's FULL shape — its
-    "fingerprint" from find_shortest_ring_junction (the sorted tuple of
-    every pairwise centroid distance between its members) — element by
-    element, within `tolerance` Angstroms, rather than by comparing just
-    the single nc_distance number each ring reports. A single-number
-    comparison fails in both directions:
+    "fingerprint" from _cycle_to_ring_result / find_shortest_ring_junction
+    (the sorted tuple of every pairwise centroid distance between its
+    members) — element by element, within `tolerance` Angstroms, rather
+    than by comparing just the single nc_distance number each ring
+    reports. A single-number comparison fails in both directions:
 
       - Two DIFFERENT rings can end up with a similar nc_distance by
         coincidence — nc_distance is only the SHORTEST junction within a
@@ -820,7 +1178,7 @@ def deduplicate_rings_by_geometry(rings, tolerance=1.5):
         two genuinely non-equivalent rings into one.
       - Two truly EQUIVALENT (symmetry-related) rings can end up with
         different nc_distance if real biological asymmetry (see module
-        docstring) happens to make a different chain pair the "shortest"
+        docstring) happens to make a different chain pair the "tightest"
         one in each copy. Comparing nc_distance alone risks treating two
         real copies of the same ring as separate findings.
 
@@ -908,6 +1266,38 @@ def _apply_annotators(ring, chain_geometry, annotators):
     return ring
 
 
+def _format_junctions(junctions):
+    """Renders the "junctions" list ([{"from_chain", "to_chain",
+    "nc_distance"}, ...] — see _cycle_to_ring_result) as one compact,
+    fully-readable string: "A->B: 2.51Å; B->C: 2.48Å; C->A: 2.60Å". A raw
+    list-of-dicts is what a DataFrame cell held before this — pandas has
+    no special rendering for that, so it either printed the Python repr
+    truncated mid-value or hid it behind "...", with no way to actually
+    read the individual Angstrom numbers off the table. This is plain
+    text specifically so every junction distance in the ring is visible
+    directly in the DataFrame, not just accessible by drilling into a
+    nested object."""
+    return "; ".join(f"{j['from_chain']}->{j['to_chain']}: {j['nc_distance']}Å" for j in junctions)
+
+
+def _format_equivalent_rings(equivalent_rings):
+    """Renders "equivalent_rings" (added by deduplicate_rings_by_geometry
+    — a list of chain-order lists, one per physical copy folded into this
+    representative) as one readable string: "[A,B,C]; [D,E,F]" — same
+    rationale as _format_junctions."""
+    return "; ".join(f"[{','.join(chains)}]" for chains in equivalent_rings)
+
+
+# Ring-dict fields that are lists needing their own readable string
+# rendering (see _format_junctions / _format_equivalent_rings) rather
+# than the generic dict-flattening or raw pass-through _flatten_ring_row
+# otherwise applies.
+_LIST_FIELD_FORMATTERS = {
+    "junctions": _format_junctions,
+    "equivalent_rings": _format_equivalent_rings,
+}
+
+
 def _flatten_ring_row(ring):
     """
     Flattens one ring dict into a single-level dict suitable for a
@@ -917,6 +1307,16 @@ def _flatten_ring_row(ring):
     becomes "orientation_backbone_angle": 12.4 — so results land as plain
     sortable/filterable columns instead of a dict blob per cell that has
     to be unpacked before it's usable.
+
+    A list value with a registered formatter (_LIST_FIELD_FORMATTERS —
+    currently "junctions" and "equivalent_rings") is rendered as a single
+    readable string rather than kept as a raw Python list: a DataFrame
+    cell holding a list of dicts has no useful display of its own, and
+    the whole point of this field existing is to show every junction's
+    actual Angstrom distance, not hide it behind an unreadable object.
+    Any OTHER list-valued field (there are none built into this module
+    today, but a future annotator could add one) is passed through
+    unchanged rather than guessed at.
 
     A None value (an annotator that ran but found nothing computable) is
     dropped rather than kept as a bare key: pandas fills it in as NaN
@@ -931,68 +1331,89 @@ def _flatten_ring_row(ring):
         if isinstance(value, dict):
             for subkey, subvalue in value.items():
                 row[f"{key}_{subkey}"] = subvalue
+        elif isinstance(value, list) and key in _LIST_FIELD_FORMATTERS:
+            row[key] = _LIST_FIELD_FORMATTERS[key](value)
         else:
             row[key] = value
     return row
 
 
-def analyze_assembly_rings(filepath, assembly_id, ring_size=None, candidate_ring_sizes=ALLOWED_RING_SIZES, tolerance=1.5, max_combinations=MAX_RING_CANDIDATE_COMBINATIONS, max_shape_cv=None, min_coverage=RING_SIZE_COVERAGE_FLOOR, annotators=None):
+def analyze_assembly_rings(filepath, assembly_id, ring_size=None, candidate_ring_sizes=ALLOWED_RING_SIZES,
+                            terminal_threshold=DEFAULT_TERMINAL_THRESHOLD,
+                            max_junction_spread=DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE,
+                            contact_threshold=DEFAULT_CONTACT_THRESHOLD,
+                            min_contact_pairs=DEFAULT_MIN_CONTACT_PAIRS,
+                            tolerance=1.5, annotators=None):
     """
     Full per-assembly ring pipeline: load the structure, compute chain
     geometry, group chains by sequence identity (the two-component
-    safeguard), determine each identity group's ring size, cluster it into
-    spatial rings of that size, and find the best fusion junction within
-    each ring.
+    safeguard — chains from DIFFERENT components/sequences are never
+    considered for the same ring; see group_chains_by_sequence), and —
+    per identity group — find every ring AND its correct fusion order via
+    the directed terminal-cycle method (see module docstring and
+    detect_rings).
 
     ring_size : the oligomeric count for the subunit you're targeting (3
         for a trimer, etc), if you already trust it — e.g. from
         oligomeric_count / stoichiometry via query.py's fetch_metadata().
-        When given, it must be one of ALLOWED_RING_SIZES and is used
-        directly (via find_best_rings_by_group_distance) for every
-        identity group, skipping auto-detection — faster, and appropriate
-        when the reported oligomeric state is already trustworthy.
+        When given, it must be one of ALLOWED_RING_SIZES and restricts
+        detect_rings to cycles of exactly that length for every identity
+        group, with no total-coverage requirement (leftover chains are
+        fine — see the "leftover" warning below).
 
-        Left as None (the default), the ring size is instead AUTO-DETECTED
-        independently for each identity group via detect_ring_size() —
-        this is "Challenge 1": recognizing how many chains belong in the
-        ring from geometry alone, with no dependency on external metadata
-        being present or correct. This is the right default for
-        exploratory work, and multi-component assemblies where different
-        proteins may form different-sized rings are handled correctly
-        since detection runs per identity group, not once for the whole
-        assembly.
+        Left as None (the default), EVERY size in candidate_ring_sizes is
+        tried, independently, against each identity group, and ALL sizes
+        that fully account for that group's chains (no residue left
+        over) are returned side by side — not just one "winning" size.
+        See detect_rings and the module docstring's TOTAL-COVERAGE AXIS
+        SELECTION section: a real point-group cage can genuinely have
+        more than one true, total symmetry axis (e.g. an octahedral
+        cage's 3-fold AND 2-fold axes), and this module no longer guesses
+        which one is "the" designed subunit — every ring in the output
+        carries its own "ring_size" field so you (or a downstream step)
+        can filter to the one you actually want, e.g. by matching a
+        trusted oligomeric_count from metadata.
 
-    candidate_ring_sizes : which sizes auto-detection may consider
-        (default ALLOWED_RING_SIZES). Only relevant when ring_size=None.
+    candidate_ring_sizes : which sizes may be considered (default
+        ALLOWED_RING_SIZES). Only relevant when ring_size=None.
 
-    max_shape_cv, min_coverage : passed straight through to
-        find_best_rings_by_group_distance / detect_ring_size for every
-        identity group — see _ideal_ring_shape_cv / RING_SHAPE_CV_JITTER_MARGIN
-        and RING_SIZE_COVERAGE_FLOOR. max_shape_cv filters out chain
-        groups whose internal shape isn't uniform enough to be a real
-        ring (rejecting, e.g., a candidate that accidentally mixes chains
-        from two different true rings);
-        min_coverage is the auto-detection qualification floor used to
-        prefer the largest valid ring size (see detect_ring_size).
+    terminal_threshold : tau, in Angstroms — passed straight through to
+        build_terminal_graph for every identity group. See
+        DEFAULT_TERMINAL_THRESHOLD.
 
-    Ring membership within a given size is found via
-    find_best_rings_by_group_distance (or detect_ring_size, which calls
-    the same underlying scoring) — every possible group of that size is
-    scored and the tightest non-overlapping groups are kept, so a ring is
-    never built by first committing to a single closest PAIR that might
-    belong to two different physical rings.
+    max_junction_spread : in Angstroms — passed straight through to
+        find_ring_cycles for every identity group. See
+        DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE and the module docstring's
+        JUNCTION UNIFORMITY section; None disables this filter.
+
+    contact_threshold, min_contact_pairs : passed straight through to
+        detect_rings for every identity group — see
+        DEFAULT_CONTACT_THRESHOLD / DEFAULT_MIN_CONTACT_PAIRS and the
+        module docstring's INTERFACE CONTACT SANITY CHECK section. Either
+        being None disables this check.
+
+    tolerance : in Angstroms — passed straight through to
+        deduplicate_rings_by_geometry only (ring ACCEPTANCE no longer
+        uses a tolerance cutoff at all — see the module docstring's
+        BUGFIX and TOLERANCE vs. TERMINAL_THRESHOLD sections).
 
     Rings that are the SAME physical ring (within `tolerance` Angstroms
     of each other, judged by full shape — see deduplicate_rings_by_geometry)
     are collapsed to one representative row, so the result doesn't repeat
-    the same ring once per symmetric copy. The full chain lists for every
-    equivalent ring are still available via the representative's
-    "equivalent_rings" field.
+    the same ring once per symmetric copy. Rings of DIFFERENT ring_size
+    are never collapsed into each other (see deduplicate_rings_by_geometry).
+    The full chain lists for every equivalent ring are still available via
+    the representative's "equivalent_rings" field.
 
     Returns {"assembly_id": ..., "rings": [ring_result, ...]} — one row
-    per DISTINCT ring found (within tolerance), potentially more than one
-    if the assembly has more than one identity group, or a genuinely
-    asymmetric arrangement.
+    per DISTINCT ring found (within tolerance), across every identity
+    group AND every ring_size that achieved total coverage for its group
+    when auto-detecting — check each row's "ring_size" to tell candidate
+    axes apart. Each ring_result is the _cycle_to_ring_result dict (see
+    that function), MINUS "fingerprint" — used only internally by
+    deduplicate_rings_by_geometry to recognize physically equivalent
+    rings, and dropped once that job is done, since it's not something a
+    user picking a subunit to build with needs to see in the output.
 
     annotators : optional list of per-ring annotator functions, e.g.
         [orientation.annotate_ring_orientation]. Each runs against this
@@ -1005,12 +1426,14 @@ def analyze_assembly_rings(filepath, assembly_id, ring_size=None, candidate_ring
         want at the call site and distance.py stays agnostic to what they
         compute.
     """
-    if ring_size is not None and ring_size not in ALLOWED_RING_SIZES:
+    sizes = (ring_size,) if ring_size is not None else tuple(candidate_ring_sizes)
+    invalid = sorted(set(sizes) - set(ALLOWED_RING_SIZES))
+    if invalid:
         raise ValueError(
-            f"ring_size must be one of {ALLOWED_RING_SIZES} — Platonic-solid "
+            f"ring size(s) must be one of {ALLOWED_RING_SIZES} — Platonic-solid "
             f"(T/O/I point-group) cages only have 2-, 3-, 4-, and 5-fold "
             f"rotational symmetry axes, so no other ring size is physically "
-            f"possible — got {ring_size}"
+            f"possible — got invalid size(s) {invalid}"
         )
 
     st = gemmi.read_structure(filepath)
@@ -1027,33 +1450,58 @@ def analyze_assembly_rings(filepath, assembly_id, ring_size=None, candidate_ring
     rings = []
     for group in identity_groups:
         usable = [name for name in group if name in chain_geometry]
+        if len(usable) < min(sizes):
+            continue
 
-        if ring_size is not None:
-            if len(usable) < ring_size:
-                continue
-            chain_groups = find_best_rings_by_group_distance(
-                usable, chain_geometry, ring_size, tolerance=tolerance,
-                max_combinations=max_combinations, max_shape_cv=max_shape_cv,
-            )
-        else:
-            detected_size, chain_groups = detect_ring_size(
-                usable, chain_geometry, candidate_sizes=candidate_ring_sizes,
-                tolerance=tolerance, max_combinations=max_combinations,
-                max_shape_cv=max_shape_cv, min_coverage=min_coverage,
-            )
-            if detected_size is None:
-                if len(usable) >= min(candidate_ring_sizes):
-                    print(
-                        f"analyze_assembly_rings: no ring size in {candidate_ring_sizes} fit "
-                        f"an identity group of {len(usable)} chains within tolerance={tolerance}Å "
-                        f"for assembly {assembly_id} — skipping this group."
-                    )
-                continue
+        accepted = detect_rings(
+            usable, chain_geometry, ring_size=ring_size, candidate_ring_sizes=candidate_ring_sizes,
+            terminal_threshold=terminal_threshold, max_junction_spread=max_junction_spread,
+            contact_threshold=contact_threshold, min_contact_pairs=min_contact_pairs,
+        )
 
-        for chain_group in chain_groups:
-            rings.append(find_shortest_ring_junction(chain_group, chain_geometry))
+        if not accepted:
+            print(
+                f"analyze_assembly_rings: no ring of size {list(sizes)} found within "
+                f"terminal_threshold={terminal_threshold}Å for an identity group of "
+                f"{len(usable)} chains in assembly {assembly_id} — skipping this group. "
+                f"(When auto-detecting, this also happens if candidate sizes were FOUND but "
+                f"none achieved total coverage of the group — see detect_rings' printed "
+                f"per-size summary above.)"
+            )
+            continue
+
+        # Only meaningful when ring_size was given explicitly: detect_rings'
+        # auto-detect path (ring_size=None) never returns a size whose
+        # accepted rings leave chains uncovered (that's the total-coverage
+        # requirement — see detect_rings), so `leftover` is always empty
+        # here in auto mode. With an explicit ring_size, no such
+        # requirement applies, so leftover chains are worth flagging.
+        assigned = {c for cycle in accepted for c in cycle["chains"]}
+        leftover = [name for name in usable if name not in assigned]
+        if len(leftover) >= min(sizes):
+            print(
+                f"analyze_assembly_rings: {len(leftover)} chains in assembly {assembly_id} "
+                f"were left unassigned after accepting {len(accepted)} ring(s) — {leftover}. "
+                f"That's enough chains to plausibly form another ring; if one is expected "
+                f"here, check whether their termini actually fall within "
+                f"terminal_threshold={terminal_threshold}Å of each other at all (a real but "
+                f"unusually spaced junction can need a larger terminal_threshold to be found "
+                f"as an edge in the first place — see the module docstring)."
+            )
+
+        for cycle in accepted:
+            ring = _cycle_to_ring_result(cycle, chain_geometry)
+            rings.append(ring)
 
     rings = deduplicate_rings_by_geometry(rings, tolerance=tolerance)
+
+    # "fingerprint" (sorted pairwise centroid distances) exists purely so
+    # deduplicate_rings_by_geometry can recognize physically equivalent
+    # rings just above — it's an internal comparison key, not a number a
+    # user would ever want to read off the output table, so it's dropped
+    # here once its one job is done.
+    for ring in rings:
+        ring.pop("fingerprint", None)
 
     if annotators:
         rings = [_apply_annotators(ring, chain_geometry, annotators) for ring in rings]
@@ -1061,7 +1509,12 @@ def analyze_assembly_rings(filepath, assembly_id, ring_size=None, candidate_ring
     return {"assembly_id": assembly_id, "rings": rings}
 
 
-def run_ring_analysis(df, ring_size=None, filepath_column="filepath", assembly_id_column="assembly_id", tolerance=1.5, candidate_ring_sizes=ALLOWED_RING_SIZES, max_combinations=MAX_RING_CANDIDATE_COMBINATIONS, max_shape_cv=None, min_coverage=RING_SIZE_COVERAGE_FLOOR, annotators=None):
+def run_ring_analysis(df, ring_size=None, filepath_column="filepath", assembly_id_column="assembly_id",
+                       candidate_ring_sizes=ALLOWED_RING_SIZES, terminal_threshold=DEFAULT_TERMINAL_THRESHOLD,
+                       max_junction_spread=DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE,
+                       contact_threshold=DEFAULT_CONTACT_THRESHOLD,
+                       min_contact_pairs=DEFAULT_MIN_CONTACT_PAIRS,
+                       tolerance=1.5, annotators=None):
     """
     Runs analyze_assembly_rings across every row of a candidates DataFrame,
     flattening the (possibly several) DISTINCT rings found per assembly
@@ -1069,21 +1522,34 @@ def run_ring_analysis(df, ring_size=None, filepath_column="filepath", assembly_i
     with the best (lowest nc_distance) rings naturally on top regardless
     of which assembly they came from.
 
-    ring_size : None (default — auto-detect independently for every
-        assembly; see analyze_assembly_rings), a fixed integer from
-        ALLOWED_RING_SIZES (same size for every row), or the NAME of a
-        column in df to look up per-row — e.g. "oligomeric_count", if you
-        fetched that via query.py's fetch_metadata() and merged it in.
-        Useful if one batch mixes candidates with different, already-known
-        oligomeric states.
-    tolerance : in Angstroms, passed straight through to every stage for
-        every assembly in the batch — see the module docstring for what
-        it controls.
-    candidate_ring_sizes, max_combinations, max_shape_cv, min_coverage :
-        passed straight through to analyze_assembly_rings for every
-        assembly in the batch — only relevant when auto-detecting
-        (ring_size is None; a per-row column always supplies an explicit
-        size). See _ideal_ring_shape_cv / RING_SIZE_COVERAGE_FLOOR.
+    ring_size : None (default — try every size in candidate_ring_sizes
+        independently for every assembly and keep ALL sizes that achieve
+        total coverage of their identity group, side by side; see
+        analyze_assembly_rings and detect_rings' TOTAL-COVERAGE AXIS
+        SELECTION), a fixed integer from ALLOWED_RING_SIZES (same size
+        for every row), or the NAME of a column in df to look up per-row
+        — e.g. "oligomeric_count", if you fetched that via query.py's
+        fetch_metadata() and merged it in. Useful if one batch mixes
+        candidates with different, already-known oligomeric states. When
+        auto-detecting, filter the resulting DataFrame's "ring_size"
+        column afterward if you only want one particular axis per
+        assembly.
+    candidate_ring_sizes : passed straight through to analyze_assembly_
+        rings for every assembly in the batch — only relevant when
+        auto-detecting (ring_size is None; a per-row column always
+        supplies an explicit size).
+    terminal_threshold : tau, in Angstroms — passed straight through to
+        every assembly in the batch. See DEFAULT_TERMINAL_THRESHOLD.
+    max_junction_spread : in Angstroms, passed straight through to every
+        assembly in the batch. See DEFAULT_JUNCTION_UNIFORMITY_TOLERANCE;
+        None disables the filter.
+    contact_threshold, min_contact_pairs : passed straight through to
+        every assembly in the batch. See DEFAULT_CONTACT_THRESHOLD /
+        DEFAULT_MIN_CONTACT_PAIRS; either being None disables the check.
+    tolerance : in Angstroms, passed straight through to analyze_assembly_
+        rings for every assembly in the batch, where it's used only for
+        deduplicate_rings_by_geometry (ring acceptance itself has no
+        tolerance cutoff — see the module docstring's BUGFIX section).
     annotators : optional list of per-ring annotator functions, passed
         straight through to analyze_assembly_rings for every assembly in
         the batch (see that function's docstring). Their output is
@@ -1122,9 +1588,10 @@ def run_ring_analysis(df, ring_size=None, filepath_column="filepath", assembly_i
         try:
             result = analyze_assembly_rings(
                 row[filepath_column], assembly_id, ring_size=this_ring_size,
-                candidate_ring_sizes=candidate_ring_sizes, tolerance=tolerance,
-                max_combinations=max_combinations, max_shape_cv=max_shape_cv,
-                min_coverage=min_coverage, annotators=annotators,
+                candidate_ring_sizes=candidate_ring_sizes, terminal_threshold=terminal_threshold,
+                max_junction_spread=max_junction_spread, contact_threshold=contact_threshold,
+                min_contact_pairs=min_contact_pairs,
+                tolerance=tolerance, annotators=annotators,
             )
             for ring in result["rings"]:
                 rows.append({"assembly_id": assembly_id, **_flatten_ring_row(ring)})

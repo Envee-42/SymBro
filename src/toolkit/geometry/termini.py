@@ -2,8 +2,9 @@
 termini.py — per-chain terminus and CA coordinate extraction.
 
 Single shared entry point for pulling N-terminal CA, C-terminal CA,
-centroid, and local terminus-direction vectors out of a chain. Everything
-downstream (NC distance, ring finding, relative terminal orientation, and
+centroid, the full per-residue CA trace, and local terminus-direction
+vectors out of a chain. Everything downstream (NC distance, ring finding,
+interface contact sanity-checking, relative terminal orientation, and
 later secondary structure / solvent accessibility) is built on top of
 this one function, so the structure only ever gets scanned once per
 chain.
@@ -87,4 +88,14 @@ def get_chain_ca_geometry(chain, vector_window=4):
         "centroid": ca_coords.mean(axis=0),
         "n_vector": n_vector,        # unit vector, direction extrapolated past N-term
         "c_vector": c_vector,        # unit vector, direction exiting at C-term
+        # Every resolved CA in sequence order, as an (n_points, 3) array —
+        # "n" and "c" above are just this array's first and last rows.
+        # Kept on the result (rather than discarded once n/c/centroid are
+        # derived) so downstream code needing more than the single-point
+        # summaries — e.g. distance.py's interface-contact sanity check,
+        # which needs to know whether TWO chains have a real, multi-residue
+        # interface rather than just one coincidentally-close termini
+        # pair — can reuse this one scan instead of re-parsing the
+        # structure a second time just to get it.
+        "ca_coords": ca_coords,
     }
