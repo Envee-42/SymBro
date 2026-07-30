@@ -4,4 +4,3 @@ from toolkit.download import download_candidates, clear_temp_dir
 from toolkit.geometry.symmetry import run_symmetry_analysis
 
 clear_temp_dir()
-
