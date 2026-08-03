@@ -3,6 +3,10 @@ from toolkit.query import build_query, search_ids, fetch_metadata, filter_metada
 from toolkit.download import download_candidates, clear_temp_dir
 from toolkit.geometry import rings, orientation
 from toolkit.geometry import structure
+from toolkit import isolate
+
+clear_temp_dir()
+isolate.clear_temp_subunits_dir()
 
 q1 = build_query("symmetry", "T", "exact_match")
 q2 = build_query("resolution", (0, 5), "range")
@@ -22,20 +26,20 @@ one_shot_df = query_candidates(
 )
 print(one_shot_df)
 
-downloads = download_candidates(one_shot_df)
+downloaded_df = download_candidates(one_shot_df)
 
-dist_df = rings.from_structure(downloads)
+dist_df = rings.from_structure(downloaded_df)
 
 print(dist_df)
 
-orientation_df = orientation.from_rings(dist_df, structures=downloads, symmetry_type="C2")
+orientation_df = orientation.from_rings(dist_df, structures=downloaded_df, symmetry_type="C3")
 
 row = orientation_df.iloc[0]
 # Filters for the matching row and extracts the filepath
-filepath = downloads.loc[downloads["assembly_id"] == row["assembly_id"], "filepath"].values[0]
+filepath = downloaded_df.loc[downloaded_df["assembly_id"] == row["assembly_id"], "filepath"].values[0]
 
 
-termini_ss_df = structure.from_rings(orientation_df, downloads, "C2")
+termini_ss_df = structure.from_rings(orientation_df, downloaded_df, "C3")
 
 orientation_df = orientation_df.merge(
     termini_ss_df[["assembly_id", "symmetry_type", "termini_ss"]],
@@ -45,4 +49,9 @@ orientation_df = orientation_df.merge(
 
 print(orientation_df)
 
+extracted_df = isolate.from_rings(orientation_df, downloaded_df)
+
+print(extracted_df[["assembly_id", "symmetry_type", "chain_groups", "filepath"]])
+
 orientation.plot_chain_group_vectors(filepath, row["chain_groups"])
+

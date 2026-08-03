@@ -2,5 +2,7 @@
 .ipynb_checkpoints/
 .venv/
 __pycache__/
-/symseeker_toolkit/temporary_files/
+toolkit/temporary_files/
+toolkit/temporary_subunits/
 __pycache__/
+INSTALLATION/

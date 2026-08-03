@@ -315,7 +315,7 @@ def isolate_assembly_rings(
 def from_rings(
     rings_df: pd.DataFrame, structures: Union[pd.DataFrame, Dict[str, str]], symmetry_type: Optional[str] = None,
     filepath_column: str = "filepath", assembly_id_column: str = "assembly_id",
-    output_dir: Optional[str] = None, file_format: str = "cif",
+    output_dir: Optional[str] = None, file_format: str = "pdb",
 ) -> pd.DataFrame:
     """
     Batch entry point, mirroring orientation.py's/structure.py's
