@@ -30,6 +30,14 @@ repeated subunits rather than fitting a global rotation matrix):
   Cα-Cα distance <= contact_cutoff) — homogeneous termini distances alone
   can't rule out two unrelated, non-adjacent copies that merely sit at a
   similar distance apart.
+- Every order this module detects — C2 included — is a head-to-tail (N-C)
+  register: a rotational symmetry axis is, by definition, a repeating
+  N-to-C arrangement of identical subunits around the axis. find_c2_groupings
+  and find_cyclic_groupings both only ever build/check N-C edges; neither
+  considers an N-N or C-C contact a candidate rotational axis, because
+  that isn't the geometry a rotation axis produces (see find_c2_groupings'
+  docstring for the history here — N-N/C-C used to be accepted too, which
+  was a bug, not a design choice).
 - Within one order, a chain may only belong to ONE accepted grouping
   (resolved by greedily accepting candidates tightest-CV-first and
   discarding anything that reuses an already-claimed chain). ACROSS
@@ -187,13 +195,30 @@ def find_c2_groupings(
     contact_cache: Optional[Dict[frozenset, bool]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    A two-fold axis has no larger loop to walk (exactly two chains), and
-    can be head-to-head (C-C), tail-to-tail (N-N), or head-to-tail (N-C,
-    checked in both directions since that's the one interface type with
-    two independent measurements to test for agreement). Every interface
-    type of every pair that passes tolerance + contact is kept as its own
-    candidate — select_disjoint_groupings then picks whichever interface
-    type is tightest per pair.
+    A two-fold axis has no larger loop to walk (exactly two chains), but a
+    genuine ROTATIONAL two-fold axis is, like every other order this
+    module detects, a head-to-tail (N-C) register: find_cyclic_groupings
+    never considers a C-to-C or N-to-N edge for C3/C4/C5 either, because
+    that isn't the geometry a rotation axis produces. So the only
+    candidate checked here is N-C, taken in both directions — nc_fwd
+    (chain a's N to chain b's C) and nc_rev (chain b's N to chain a's C),
+    the two independent measurements a real two-fold's head-to-tail
+    register produces — required to agree with each other via the same
+    step-homogeneity test every other order uses.
+
+    N-N and C-C used to also be accepted here as alternate C2 "interface
+    types", on the reasoning that a two-fold axis might reasonably be
+    head-to-head or tail-to-tail instead. That was a bug, not a design
+    choice: an N-N or C-C contact is a single distance measurement, so its
+    population std is trivially 0.0 and its CV is trivially 0.0 — which
+    means it would ALWAYS out-rank a real two-measurement N-C candidate in
+    select_disjoint_groupings' CV-tightest-first sort, even when a
+    genuine, tolerance-and-contact-passing N-C axis was also present for
+    the same pair. In practice this meant a nearby but non-rotational
+    tail-to-tail or head-to-head contact would almost always be reported
+    as "the" C2 axis instead of the real one. Restricting this function to
+    N-C only removes the false positives and the ranking bias in one move,
+    and brings C2 in line with how C3/C4/C5 were already being detected.
     """
     n_coords = _terminal_coords(chain_geometry, chain_names, "N")
     c_coords = _terminal_coords(chain_geometry, chain_names, "C")
@@ -204,30 +229,22 @@ def find_c2_groupings(
         ia, ib = index_of[a], index_of[b]
         pair = tuple(sorted((a, b)))
 
-        nn = float(np.linalg.norm(n_coords[ia] - n_coords[ib]))
-        cc = float(np.linalg.norm(c_coords[ia] - c_coords[ib]))
         nc_fwd = float(np.linalg.norm(n_coords[ia] - c_coords[ib]))
         nc_rev = float(np.linalg.norm(c_coords[ia] - n_coords[ib]))
+        mean, std, cv = _step_stats([nc_fwd, nc_rev])
 
-        candidates = [
-            ("N-N", [(a, b, nn)], nn, 0.0, 0.0),
-            ("C-C", [(a, b, cc)], cc, 0.0, 0.0),
-        ]
-        nc_mean, nc_std, nc_cv = _step_stats([nc_fwd, nc_rev])
-        candidates.append(("N-C", [(a, b, nc_fwd), (b, a, nc_rev)], nc_mean, nc_std, nc_cv))
+        if max_candidate_distance is not None and mean > max_candidate_distance:
+            continue
+        if not _passes_tolerance(std, cv, tolerance, relative_tolerance):
+            continue
+        if not _has_contact(chain_geometry, a, b, contact_cutoff, contact_cache):
+            continue
 
-        for interface_type, junctions, mean, std, cv in candidates:
-            if max_candidate_distance is not None and mean > max_candidate_distance:
-                continue
-            if not _passes_tolerance(std, cv, tolerance, relative_tolerance):
-                continue
-            if not _has_contact(chain_geometry, a, b, contact_cutoff, contact_cache):
-                continue
-            results.append({
-                "chains": pair, "chain_set": frozenset(pair), "interface_type": interface_type,
-                "junctions": junctions, "mean_distance": round(mean, 2), "std_distance": round(std, 2),
-                "cv": round(cv, 4) if np.isfinite(cv) else None,
-            })
+        results.append({
+            "chains": pair, "chain_set": frozenset(pair), "interface_type": "N-C",
+            "junctions": [(a, b, nc_fwd), (b, a, nc_rev)], "mean_distance": round(mean, 2),
+            "std_distance": round(std, 2), "cv": round(cv, 4) if np.isfinite(cv) else None,
+        })
 
     return results
 
