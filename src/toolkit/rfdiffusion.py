@@ -82,6 +82,7 @@ Design, in short:
 """
 
 import glob
+import math
 import os
 import re
 import subprocess
@@ -89,6 +90,7 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import gemmi
+import pandas as pd
 
 from toolkit.config import get_tool_config
 
@@ -419,6 +421,96 @@ def prepare_fusion_job(
         hotspot_res=hotspot_res, num_designs=num_designs, diffuser_T=diffuser_T,
         extra_overrides=dict(extra_overrides or {}),
     )
+
+
+# ============================================================================
+# Batch ring-dataframe enrichment
+# ============================================================================
+
+def process_ring_dataframe(df: pd.DataFrame, pdb_paths: Dict[str, str]) -> pd.DataFrame:
+    """
+    Enriches a ring-grain dataframe (e.g. orientation_df) with everything
+    prepare_fusion_job() needs to build a job straight from a row:
+
+    1. Drops "orientation_junctions" if present — internal bookkeeping
+       column not needed past this point.
+    2. Derives a recommended (min, max) linker length in RESIDUES from
+       "mean_distance" (the N/C-terminal CA-CA gap in Angstroms, from
+       termini.py/rings.py), at roughly 3.2 A/residue for a near-extended
+       chain plus a couple of residues' slack either side, rounded UP
+       (math.ceil) so the recommendation never suggests a linker too
+       short to physically close the gap:
+
+           recommended_min = ceil(mean_distance / 3.2 + 2)
+           recommended_max = ceil(mean_distance / 3.2 + 7)
+
+       These feed straight into prepare_fusion_job's own
+       linker_length=(recommended_min, recommended_max) argument.
+    3. Reads each row's already-isolated ring PDB and appends each
+       chain's residue count as chain_lengths: {chain_id: length}. Uses
+       gemmi (matching every other structure-reading step in this
+       project — isolate.py, structure.py, termini.py, rings.py, and
+       orientation.py all read structures the same way) rather than a
+       second parsing library. chain_lengths is keyed by whatever chain
+       ids are actually IN the file — the short A/B/C ids isolate.py's
+       file_format="pdb" assigns, not the original long RCSB names — so
+       translate through the same rename_map if you need to match it
+       back up against chain_groups.
+
+    pdb_paths : {assembly_id: pdb_path} — exactly where each row's
+        isolated ring file actually lives. Deliberately explicit rather
+        than guessed from assembly_id + a folder: isolate.py's own
+        naming (f"{assembly_id}_{symmetry_type}_{chains}.pdb") and any
+        custom output_path you pick when calling extract_ring_structure()
+        directly rarely line up with a hand-rolled filename guess, and a
+        missed guess used to fail silently (chain_lengths just came back
+        empty, no error). Build this dict from whatever you already have:
+
+            # from single-row extract_ring_structure() calls:
+            pdb_paths = {}
+            for _, row in orientation_df.iterrows():
+                path, _ = isolate.extract_ring_structure(
+                    filepath, row["chain_groups"],
+                    f"temporary_subunits/{row['assembly_id']}_ring.pdb",
+                    file_format="pdb",
+                )
+                pdb_paths[row["assembly_id"]] = path
+
+            # or straight from isolate.py's own batch output:
+            isolated_df = isolate.from_rings(orientation_df, downloaded_df)
+            pdb_paths = dict(zip(isolated_df["assembly_id"], isolated_df["filepath"]))
+
+    A row whose assembly_id isn't in pdb_paths, or whose file no longer
+    exists on disk, is reported and given chain_lengths={} rather than
+    raising — same fail-soft convention isolate_assembly_rings() already
+    uses for an unresolvable chain_group.
+    """
+    df = df.copy()
+
+    if "orientation_junctions" in df.columns:
+        df = df.drop(columns=["orientation_junctions"])
+
+    mean_distance = df["mean_distance"]
+    df["recommended_min"] = ((mean_distance / 3.2) + 2).apply(math.ceil)
+    df["recommended_max"] = ((mean_distance / 3.2) + 7).apply(math.ceil)
+
+    def fetch_lengths(assembly_id: str) -> Dict[str, int]:
+        file_path = pdb_paths.get(assembly_id)
+        if not file_path or not os.path.exists(file_path):
+            print(f"Warning: no isolated PDB found for {assembly_id!r} (pdb_paths has {file_path!r})")
+            return {}
+
+        structure = gemmi.read_structure(file_path)
+        model = structure[0]
+        return {
+            chain.name: len(chain.get_polymer())
+            for chain in model
+            if len(chain.get_polymer())
+        }
+
+    df["chain_lengths"] = df["assembly_id"].apply(fetch_lengths)
+
+    return df
 
 
 # ============================================================================

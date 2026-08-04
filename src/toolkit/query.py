@@ -114,7 +114,8 @@ SEARCH_ATTRIBUTES = {
     "title": "struct.title",
     "date": "rcsb_accession_info.deposit_date",
     "pfam_id": "rcsb_polymer_entity_annotation.annotation_id",
-    "entry_id": "rcsb_entry_container_identifiers.entry_id"
+    "entry_id": "rcsb_entry_container_identifiers.entry_id",
+    "description": "rcsb_polymer_entity.pdbx_description"
 }
 
 
@@ -146,6 +147,7 @@ DATA_ATTRIBUTES["title"] = "entry.struct.title"
 DATA_ATTRIBUTES["date"] = "entry.rcsb_accession_info.deposit_date"
 DATA_ATTRIBUTES["pfam_id"] = "entry.polymer_entities.rcsb_polymer_entity_annotation.annotation_id"
 DATA_ATTRIBUTES["entry_id"] = "entry.rcsb_entry_container_identifiers.entry_id"
+DATA_ATTRIBUTES["description"] = "entry.polymer_entities.rcsb_polymer_entity.pdbx_description"
 
 # --- Fetch-only fields: NO Search API equivalent exists at all -------------
 # These can be fetched via fetch_metadata()/query_candidates(), and filtered
