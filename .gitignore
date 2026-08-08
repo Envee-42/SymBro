@@ -5,6 +5,7 @@ __pycache__/
 /temporary_files/
 /temporary_subunits/
 /temporary_simulations/
+/.symbro/
 installation.yaml
 /ProteinMPNN/
 *.egg-info/
