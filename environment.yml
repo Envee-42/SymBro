@@ -1,0 +1,24 @@
+# Conda alternative to `pip install -e .` -- useful if you'd rather get
+# gemmi/numpy/pandas/etc. from conda-forge than from PyPI wheels.
+#
+#   conda env create -f environment.yml
+#   conda activate symseeker
+#
+# rcsb-api has no conda-forge package, so it (and the project itself,
+# in editable mode) are installed via pip inside the conda env.
+name: symseeker
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy>=1.26
+  - pandas>=2.0
+  - gemmi>=0.7
+  - matplotlib>=3.7
+  - networkx>=3.0
+  - requests>=2.31
+  - pyyaml>=6.0
+  - pip
+  - pip:
+      - rcsb-api>=1.7
+      - -e .

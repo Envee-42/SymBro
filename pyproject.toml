@@ -10,6 +10,16 @@ license = { text = "Apache-2.0" }
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "gemmi>=0.7",
+    "matplotlib>=3.7",
+    "networkx>=3.0",
+    "requests>=2.31",
+    "PyYAML>=6.0",
+    "rcsb-api>=1.7",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
