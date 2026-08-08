@@ -1,0 +1,194 @@
+# installation.yaml — per-machine tool settings, read by config.py.
+#
+# Setup: copy this file to "installation.yaml" (same folder) and fill in
+# the two repo_path lines below with your own local clones. That's it.
+#
+#   cp installation.example.yaml installation.yaml
+#
+# installation.yaml itself should be gitignored (add it to .gitignore) —
+# it's going to contain absolute paths specific to your own machine, and
+# committing it would break the moment anyone else pulls the repo.
+#
+# Every key below is optional. Leave out anything you don't need — each
+# tool's submit()/run() function falls back to a sensible default (e.g.
+# python_executable defaults to plain "python") for anything missing.
+
+rfdiffusion:
+  # "local" (bare subprocess, assumes RFdiffusion is directly importable
+  # in python_executable's env), "singularity" (runs a .sif image — a
+  # common choice on a shared HPC cluster without a scheduler), or
+  # "slurm" (submits an sbatch script to an HPC scheduler — the usual
+  # choice on a shared HPC cluster THAT uses SLURM; see the "slurm:"
+  # section below).
+  backend: local
+
+  # Folder containing scripts/run_inference.py — i.e. wherever you ran
+  # `git clone https://github.com/RosettaCommons/RFdiffusion`. Used as
+  # the working directory for both backend: local and backend: slurm
+  # with slurm.inner_backend: local (run_inference.py is invoked via a
+  # path relative to this folder).
+  repo_path: /path/to/RFdiffusion
+
+  # Python interpreter with RFdiffusion's dependencies installed (its own
+  # conda env, most likely). Defaults to plain "python" if omitted.
+  python_executable: /path/to/envs/rfdiffusion/bin/python
+
+  # Only used when backend: singularity, OR backend: slurm with
+  # slurm.inner_backend: singularity (see below) —
+  # singularity_image: /path/to/rfdiffusion.sif
+  # model_directory: /path/to/rfdiffusion/models
+
+  # ------------------------------------------------------------------
+  # Only used when backend: slurm.
+  #
+  # "slurm" is a SCHEDULING layer, not a third way of actually running
+  # RFdiffusion: it submits an sbatch script that wraps EITHER the
+  # "local" or "singularity" execution style — inner_backend picks
+  # which. Most clusters that block Docker still allow Singularity/
+  # Apptainer, so inner_backend: singularity (+ singularity_image above)
+  # is the most common real-world combination; inner_backend: local
+  # works too if RFdiffusion is already installed directly in a conda
+  # env reachable from a compute node.
+  # ------------------------------------------------------------------
+  # inner_backend: singularity   # or "local" (default: local)
+
+  slurm:
+    # Every one of these is site-specific — nothing here is guessed or
+    # hardcoded in the toolkit itself. Ask your cluster's docs/admins
+    # for the right values; there is no universal convention across HPC
+    # sites for partition names or GPU resource syntax.
+
+    partition: gpu
+    # account: myallocation        # omit if your cluster doesn't need one
+    time: "04:00:00"               # HH:MM:SS, or any sbatch --time syntax
+
+    # GPU request — clusters differ on which flag they expect. Set
+    # WHICHEVER (or both, or neither if your GPU partition auto-allocates):
+    gres: "gpu:1"                  # older-style: --gres=gpu:1
+    # gpus: 1                      # newer-style: --gpus=1
+
+    cpus_per_task: 4
+    mem: "16G"
+    job_name: rfdiffusion
+
+    # Arbitrary shell lines run before the RFdiffusion command itself —
+    # module loads, conda/venv activation, environment variables. This is
+    # almost always needed: a fresh compute node doesn't inherit your
+    # login shell's environment.
+    setup_lines:
+      - "module load cuda/12.1"
+      - "source activate rfdiffusion-env"
+      # - "module load singularity"   # if inner_backend: singularity needs it too
+
+    # Escape hatch for any #SBATCH directive not modeled explicitly above
+    # (e.g. a node feature constraint, a QoS, an exclusive-node request):
+    extra_sbatch_directives: []
+    # extra_sbatch_directives:
+    #   - "constraint=a100"
+    #   - "qos=high"
+
+    # sbatch_executable: sbatch    # rarely needs changing
+
+proteinmpnn:
+  # Folder containing protein_mpnn_run.py and helper_scripts/ — i.e.
+  # wherever you ran `git clone https://github.com/dauparas/ProteinMPNN`.
+  repo_path: /path/to/ProteinMPNN
+
+  # Python interpreter with ProteinMPNN's dependencies installed.
+  # Defaults to plain "python" if omitted.
+  python_executable: /path/to/envs/proteinmpnn/bin/python
+
+# ==========================================================================
+# Structure-prediction self-consistency screening — three interchangeable
+# backends (alphafold2.py / boltz.py / af3.py, all sharing one
+# selfconsistency.py core), picked by NAME rather than by which one
+# happens to be imported. See structure_prediction.py's own module
+# docstring for the full "which one should I use" comparison — the short
+# version: alphafold2 and boltz are both fully permissive licenses
+# (commercial-safe, redistributable); af3's model WEIGHTS specifically
+# are not (non-commercial only, obtained directly from Google, cannot be
+# redistributed) — see af3's own section below before using it.
+# ==========================================================================
+
+structure_prediction:
+  # Lets you call structure_prediction.run(None, ...) instead of naming
+  # a predictor at every call site. Optional — every predictor is always
+  # also reachable directly (alphafold2.run(...), boltz.run(...),
+  # af3.run(...)) whether or not this is set.
+  default: alphafold2   # or "boltz" / "af3"
+
+alphafold2:
+  # ColabFold running AlphaFold2 — see alphafold2.py's own module
+  # docstring for the full licensing rundown (short version: fully
+  # permissive, commercial-safe, no extra acknowledgement needed).
+  #
+  # Same "local" / "singularity" / "slurm" backend choice as rfdiffusion
+  # above, and the SAME slurm: sub-block shape (inner_backend, sbatch
+  # resource keys, setup_lines, extra_sbatch_directives) — not repeated
+  # in full here to avoid duplicating the same comments twice; see
+  # rfdiffusion's slurm: block above if you need the field-by-field
+  # explanation.
+  backend: local
+  colabfold_executable: colabfold_batch   # assumes it's on PATH after your ColabFold install
+  # singularity_image: /path/to/colabfold.sif
+  # inner_backend: singularity            # only used with backend: slurm
+  # slurm:
+  #   partition: gpu
+  #   time: "04:00:00"
+  #   gres: "gpu:1"
+  #   setup_lines:
+  #     - "module load cuda/12.1"
+  #     - "source activate colabfold-env"
+
+boltz:
+  # jwohlwend/boltz — see boltz.py's own module docstring for licensing
+  # (code AND weights both MIT, explicitly for academic and commercial
+  # use — the cleanest of the three backends license-wise).
+  backend: local
+  boltz_executable: boltz                 # assumes it's on PATH after `pip install boltz`
+  # singularity_image: /path/to/boltz.sif
+  # inner_backend: singularity            # only used with backend: slurm
+  # slurm:
+  #   partition: gpu
+  #   time: "04:00:00"
+  #   gres: "gpu:1"
+  #   setup_lines:
+  #     - "module load cuda/12.1"
+  #     - "source activate boltz-env"
+
+af3:
+  # google-deepmind/alphafold3 — READ af3.py's own module docstring
+  # before using this one. Source code is Apache 2.0, but the model
+  # WEIGHTS are restricted to non-commercial use, must be requested
+  # directly from Google (this project never fetches or bundles them),
+  # and cannot be redistributed. af3.submit()/af3.run() refuse to run
+  # unless terms_acknowledged is set — either pass it as a kwarg each
+  # call, or set it once here after you've actually read the terms at
+  # https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+  terms_acknowledged: false   # set true only after reading the URL above
+
+  backend: local
+  python_executable: /path/to/envs/alphafold3/bin/python
+  # script_path: run_alphafold.py         # relative to wherever you run from
+
+  # REQUIRED (no default) — must point at weights YOU obtained directly
+  # from Google under their terms:
+  # model_dir: /path/to/af3/models
+
+  # REQUIRED unless you pass run_data_pipeline: false — AF3's own
+  # genetic/template database directory. Unlike alphafold2/boltz above,
+  # AF3 has no free hosted MSA search option built in, so this is a
+  # much larger local disk/setup commitment (hundreds of GB) than either
+  # other backend — see af3.py's own docstring.
+  # db_dir: /path/to/af3/public_databases
+
+  # singularity_image: /path/to/af3.sif   # built from AF3's own Dockerfile
+  # inner_backend: singularity            # only used with backend: slurm
+  # slurm:
+  #   partition: gpu
+  #   time: "08:00:00"
+  #   gres: "gpu:1"
+  #   mem: "64G"
+  #   setup_lines:
+  #     - "module load cuda/12.1"
+  #     - "source activate alphafold3-env"

@@ -63,6 +63,66 @@ MANIFEST_NAME = "job_manifest.json"
 BUNDLE_INPUT_NAME = "input.pdb"
 BUNDLE_OUTPUT_PREFIX = "output/design"
 
+# Name of the workspace-visible scratch folder Colab's upload/download
+# round trip stages through — same "temporary_X/" convention download.py's
+# TEMP_DIR_NAME (temporary_files/) already established, just for Colab
+# bundles/results instead of downloaded PDB structures. Kept as a
+# module-level constant (rather than hardcoded inline) so there's exactly
+# one place to change if you ever want to rename it.
+TEMP_SIMULATIONS_DIR_NAME = "temporary_simulations"
+
+
+def get_simulations_dir():
+    """
+    Returns the absolute path to the temporary_simulations/ folder,
+    creating it if it doesn't exist yet. Mirrors download.py's
+    get_temp_dir() exactly: resolved relative to the current working
+    directory (normally your project root) so it shows up right there in
+    your workspace/editor, rather than in the OS's hidden temp space —
+    and gives Colab's own upload/download round trip one predictable,
+    easy-to-find home instead of scattering bundle/results files into
+    wherever a script happened to be run from.
+    """
+    path = os.path.join(os.getcwd(), TEMP_SIMULATIONS_DIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def clear_simulations_dir(dir_path=None):
+    """
+    Deletes everything INSIDE temporary_simulations/ (or a custom dir_path)
+    but keeps the folder itself in place — same "easy to delete when the
+    work is done" button as download.py's clear_temp_dir() and isolate.py's
+    clear_temp_subunits_dir(). Call this once a session\'s Colab bundles/
+    results and ProteinMPNN designs are no longer needed — both colab.py
+    (bundles, extracted results) and proteinmpnn.py (extracted zips,
+    mpnn_designs/) write into this SAME physical folder (both modules
+    independently resolve TEMP_SIMULATIONS_DIR_NAME to
+    os.path.join(os.getcwd(), "temporary_simulations") — see proteinmpnn.py's
+    own get_simulations_dir() docstring for why that constant is duplicated
+    rather than imported from here), so clearing it from either module
+    clears everything either one wrote, not just its own share of it.
+
+    Safe to call even if temporary_simulations/ is already empty, or was
+    never created this session at all (nothing to clear -> no-op, not an
+    error) — unlike get_simulations_dir(), this does NOT create the folder
+    if it's missing.
+    """
+    if dir_path is None:
+        dir_path = get_simulations_dir()
+    if not os.path.isdir(dir_path):
+        return
+
+    for entry in os.listdir(dir_path):
+        entry_path = os.path.join(dir_path, entry)
+        if entry.startswith('.'):
+            continue
+
+        if os.path.isfile(entry_path) or os.path.islink(entry_path):
+            os.remove(entry_path)
+        else:
+            shutil.rmtree(entry_path)
+
 
 def prepare_colab_bundle(job: RFdiffusionJob, bundle_dir: Optional[str] = None, zip_bundle: bool = True) -> str:
     """
@@ -77,13 +137,24 @@ def prepare_colab_bundle(job: RFdiffusionJob, bundle_dir: Optional[str] = None, 
     relative output_prefix — so the notebook never has to know, or guess,
     any of Symseeker's own paths.
 
+    bundle_dir defaults to a "<job-stem>_colab_bundle" folder INSIDE
+    get_simulations_dir() (temporary_simulations/) rather than the current
+    working directory — same workspace-visible-scratch-folder philosophy
+    as download.py's temporary_files/, so the .zip you're about to upload
+    lands somewhere predictable instead of wherever the script happened to
+    run from. (The results.zip you later download back from Colab is a
+    manual browser download, so this module can't place it for you — but
+    temporary_simulations/ is the natural spot to save it, right next to
+    the bundle that produced it, before calling import_colab_results().)
+    Pass an explicit bundle_dir to override this.
+
     Returns the path actually produced: a .zip file if zip_bundle=True
     (the default — a single file is what Colab's upload widget wants), or
     the bundle folder itself if zip_bundle=False.
     """
     if bundle_dir is None:
         base = os.path.splitext(os.path.basename(job.output_prefix))[0] or "job"
-        bundle_dir = f"{base}_colab_bundle"
+        bundle_dir = os.path.join(get_simulations_dir(), f"{base}_colab_bundle")
 
     if os.path.exists(bundle_dir):
         shutil.rmtree(bundle_dir)
@@ -149,6 +220,20 @@ def import_colab_results(job: RFdiffusionJob, downloaded_path: str, cleanup: boo
     someone else's machine) and log_path is always None (the notebook's
     own output cells are that job's log, not a file Symseeker can reach).
     """
+    if not os.path.exists(downloaded_path):
+        raise FileNotFoundError(
+            f"downloaded_path={downloaded_path!r} does not exist — this needs to be the "
+            f"actual path to wherever your browser saved the notebook's results.zip "
+            f"(often your Downloads folder, NOT necessarily the folder this script runs "
+            f"from), or its already-unzipped folder. A bare relative name like "
+            f"'results.zip' only resolves if that exact file is sitting in the current "
+            f"working directory — pass an absolute path, or move/save the download into "
+            f"get_simulations_dir() (temporary_simulations/) first and point here instead. "
+            f"(Without this check, a wrong path here used to be silently treated as an "
+            f"already-unzipped folder, producing a confusing 'no design_*.pdb found' error "
+            f"instead of this one.)"
+        )
+
     extract_dir = downloaded_path
     temp_extract = None
     if os.path.isfile(downloaded_path) and downloaded_path.endswith(".zip"):
@@ -159,13 +244,32 @@ def import_colab_results(job: RFdiffusionJob, downloaded_path: str, cleanup: boo
             zf.extractall(temp_extract)
         extract_dir = temp_extract
 
-    found = sorted(glob.glob(os.path.join(extract_dir, "**", "design_*.pdb"), recursive=True))
+    # TOP-LEVEL ONLY, never recursive: the companion notebook writes a
+    # "traj/" subfolder alongside the real per-design output whenever
+    # trajectory recording is on (RFdiffusion's own
+    # scripts/run_inference.py convention), containing per-step diffusion
+    # snapshots named like "design_0_pX0_traj.pdb" and
+    # "design_0_Xt-1_traj.pdb" — a RECURSIVE "design_*.pdb" glob would
+    # silently sweep those half-denoised trajectory frames in as if they
+    # were finished designs. If extract_dir has no top-level matches,
+    # check exactly one level of nesting (skipping any "traj" folder) —
+    # covers an unzipped bundle whose real layout is
+    # "<extract_dir>/output/design_0.pdb" rather than flat.
+    found = sorted(glob.glob(os.path.join(extract_dir, "design_*.pdb")))
+    if not found:
+        subdirs = [
+            os.path.join(extract_dir, name) for name in os.listdir(extract_dir)
+            if name != "traj" and os.path.isdir(os.path.join(extract_dir, name))
+        ] if os.path.isdir(extract_dir) else []
+        if len(subdirs) == 1:
+            found = sorted(glob.glob(os.path.join(subdirs[0], "design_*.pdb")))
+
     if not found:
         raise FileNotFoundError(
-            f"No 'design_*.pdb' files found under {downloaded_path!r} — make "
-            f"sure you downloaded the notebook's results.zip and pointed this "
-            f"at it (or its unzipped folder) as-is, without renaming anything "
-            f"inside it."
+            f"No 'design_*.pdb' files found under {downloaded_path!r} (checked one level "
+            f"of nesting too, skipping any 'traj/' folder) — make sure you downloaded the "
+            f"notebook's results.zip and pointed this at it (or its unzipped folder) "
+            f"as-is, without renaming anything inside it."
         )
 
     output_dir = os.path.dirname(job.output_prefix)
@@ -194,4 +298,10 @@ def import_colab_results(job: RFdiffusionJob, downloaded_path: str, cleanup: boo
         "designs_expected": job.num_designs,
         "design_paths": design_paths,
         "log_path": None,
-    }
+        # The RFdiffusionJob that produced these designs, carried straight
+        # through -- lets pmpnn.py's fixed_positions_from_contig_match()
+        # find each design's native/fixed segments by matching back against
+        # this SAME job.input_pdb + job.contigs, without the caller having
+        # to separately track and re-pass the job object themselves.
+        "job": job,
+    }

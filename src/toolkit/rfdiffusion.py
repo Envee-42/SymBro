@@ -57,34 +57,40 @@ Design, in short:
   Both are cheap enough to call every second or two from a NiceGUI
   ui.timer callback without any special threading.
 
-- Two backends are implemented: "local" (bare subprocess.Popen — assumes
-  RFdiffusion is directly installed in a reachable Python env) and
-  "singularity" (runs a .sif container image — the realistic path for
-  most real users, since RFdiffusion's install is heavy and most target
-  users are on shared HPC/SLURM clusters where Docker is usually blocked
-  but Singularity/Apptainer isn't; confirmed against prosculpt's own
-  production installation.yaml, a directly comparable published tool).
-  The singularity backend bind-mounts each host folder the job touches
-  to the SAME path inside the container (rather than remapping to a
-  fixed in-container path and rewriting every Hydra override to match,
-  which is what prosculpt itself does) — simpler, and there's no path to
-  get subtly wrong between host and container. A "slurm" backend is the
-  documented next step (see external_tools_architecture.md) —
-  submit()'s backend= parameter and RFdiffusionRun's shape are already
-  set up so adding it never changes how poll_status()/cancel() are
-  called.
+- Three backends are implemented: "local" (bare subprocess.Popen —
+  assumes RFdiffusion is directly installed in a reachable Python env),
+  "singularity" (runs a .sif container image — confirmed against
+  prosculpt's own production installation.yaml, a directly comparable
+  published tool), and "slurm" (submits an sbatch script to an HPC
+  scheduler — see _submit_slurm()'s own docstring for the full design;
+  verified directly against SchedMD's own sbatch/squeue/sacct
+  documentation, not recalled from memory). The singularity backend
+  bind-mounts each host folder the job touches to the SAME path inside
+  the container (rather than remapping to a fixed in-container path and
+  rewriting every Hydra override to match, which is what prosculpt
+  itself does) — simpler, and there's no path to get subtly wrong
+  between host and container.
 
 - Per-user tool paths (which backend, the .sif image path, GPU/bind
-  settings) are never hardcoded here — they're read from config.py's
-  installation config (a gitignored YAML file, following prosculpt's own
-  installation.yaml convention) via submit(job, config=...), or can
-  still be passed explicitly/individually for scripting and tests.
+  settings, SLURM partition/account/resources) are never hardcoded here
+  — they're read from config.py's installation config (a gitignored YAML
+  file, following prosculpt's own installation.yaml convention) via
+  submit(job, config=...), or can still be passed explicitly/
+  individually for scripting and tests. Confirmed against prosculpt's
+  own slurm_runner.py: it takes the exact same approach (SLURM options
+  are entirely config-driven, nothing about partition/gres/account
+  hardcoded) — this module follows the same philosophy, just submitted
+  via subprocess argv lists (never os.system()/shell strings, matching
+  every other command this module builds) and with actual poll_status()/
+  cancel() support, which prosculpt's own fire-and-forget slurm_runner.py
+  doesn't attempt.
 """
 
 import glob
 import math
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -364,14 +370,19 @@ def build_command(job: RFdiffusionJob, script_path: str = "scripts/run_inference
     """
     Builds the argv LIST (never a shell string) for invoking RFdiffusion
     directly via "python scripts/run_inference.py ..." — the "local"
-    backend's command. See _submit_singularity for the container
+    backend's command (also reused, wrapped in an sbatch script, by the
+    "slurm" backend when its inner_backend is "local" — see
+    _submit_slurm()). See _build_singularity_argv() for the container
     equivalent.
 
     Returned as a list on purpose: subprocess.Popen given a list bypasses
     the shell entirely, so RFdiffusion's fiddly contig syntax (square
     brackets, and the literal space in a chain-break token — see
     build_contig_string) never needs manual shell-quoting or escaping —
-    each element reaches the process verbatim as one argv entry.
+    each element reaches the process verbatim as one argv entry. (The
+    "slurm" backend, which HAS to write a real shell script file, restores
+    this same safety by shlex.quote()-ing every argv token when it renders
+    the script — see _render_sbatch_script().)
     """
     return [python_executable, script_path] + _build_overrides(job)
 
@@ -522,9 +533,18 @@ class RFdiffusionRun:
     """Handle to a dispatched (possibly still-running) RFdiffusion job."""
 
     job: RFdiffusionJob
-    process: subprocess.Popen
+    process: Optional[subprocess.Popen]
     command: List[str]
     log_path: str
+    # Only set for backend="slurm" (None for local/singularity) — the
+    # scheduler's own job id (e.g. "128"), used by poll_status()/cancel()
+    # to query squeue/sacct/scancel instead of a local subprocess handle.
+    slurm_job_id: Optional[str] = None
+    # Only set for backend="slurm" — the actual .sh file submitted via
+    # sbatch, kept alongside `command`/`log_path` for debugging (e.g. to
+    # see exactly what ran on the compute node, including #SBATCH
+    # directives and any setup_lines).
+    sbatch_script_path: Optional[str] = None
 
 
 def submit(job: RFdiffusionJob, backend: Optional[str] = None, config: Optional[dict] = None, **backend_kwargs) -> RFdiffusionRun:
@@ -535,22 +555,21 @@ def submit(job: RFdiffusionJob, backend: Optional[str] = None, config: Optional[
     typically takes minutes, not seconds), and poll it from a ui.timer
     callback instead of the UI freezing on a blocking call.
 
-    backend : "local" (bare subprocess.Popen) or "singularity" (runs a
-        .sif container image — see _submit_singularity; the recommended
-        path for most real users, see module docstring). If not given
-        explicitly, resolved from config["rfdiffusion"]["backend"] —
-        defaults to "local" if neither is set, so existing calls that
-        pass neither backend= nor config= keep working unchanged.
+    backend : "local" (bare subprocess.Popen), "singularity" (runs a
+        .sif container image — see _submit_singularity), or "slurm"
+        (submits an sbatch script to an HPC scheduler — see
+        _submit_slurm(); the recommended path for most real users on a
+        shared cluster, see module docstring). If not given explicitly,
+        resolved from config["rfdiffusion"]["backend"] — defaults to
+        "local" if neither is set, so existing calls that pass neither
+        backend= nor config= keep working unchanged.
     config  : the dict load_installation_config() returns (or an
         equivalent hand-built dict, e.g. for tests) — supplies
         per-backend settings (singularity_image, python_executable,
-        etc.) that aren't given explicitly via backend_kwargs.
-        backend_kwargs always win over anything from config, and config
-        is entirely optional: everything can still be passed by hand.
-
-    "slurm" is the documented next step (external_tools_architecture.md)
-    — it would return the same RFdiffusionRun shape, so
-    poll_status()/cancel() keep working unchanged once added.
+        slurm partition/account/resources, etc.) that aren't given
+        explicitly via backend_kwargs. backend_kwargs always win over
+        anything from config, and config is entirely optional:
+        everything can still be passed by hand.
     """
     tool_config = get_tool_config(config or {}, "rfdiffusion")
     if backend is None:
@@ -560,6 +579,12 @@ def submit(job: RFdiffusionJob, backend: Optional[str] = None, config: Optional[
         defaults = {
             "python_executable": tool_config.get("python_executable", "python"),
             "script_path": tool_config.get("script_path", "scripts/run_inference.py"),
+            # repo_path doubles as the "local" backend's cwd: run_inference.py
+            # is invoked via the RELATIVE "scripts/run_inference.py" (see
+            # build_command()), which only resolves correctly if the child
+            # process's cwd is the RFdiffusion repo itself — same reasoning
+            # pmpnn.py's _run_local() already documents for ProteinMPNN.
+            "cwd": tool_config.get("repo_path"),
         }
         return _submit_local(job, **{**defaults, **backend_kwargs})
 
@@ -579,9 +604,46 @@ def submit(job: RFdiffusionJob, backend: Optional[str] = None, config: Optional[
             )
         return _submit_singularity(job, **merged)
 
+    if backend == "slurm":
+        slurm_config = dict(tool_config.get("slurm") or {})
+        inner_backend = tool_config.get("inner_backend", "local")
+        defaults = {
+            "inner_backend": inner_backend,
+            # local-style inner command settings:
+            "python_executable": tool_config.get("python_executable", "python"),
+            "script_path": tool_config.get("script_path", "scripts/run_inference.py"),
+            "repo_path": tool_config.get("repo_path"),
+            # singularity-style inner command settings:
+            "image": tool_config.get("singularity_image"),
+            "singularity_executable": tool_config.get("singularity_executable", "singularity"),
+            "model_directory": tool_config.get("model_directory"),
+            "bind_paths": tool_config.get("bind_paths", []),
+            "use_gpu": tool_config.get("use_gpu", True),
+            # sbatch directives / scheduling settings:
+            "partition": slurm_config.get("partition"),
+            "account": slurm_config.get("account"),
+            "time": slurm_config.get("time", "04:00:00"),
+            "gres": slurm_config.get("gres"),
+            "gpus": slurm_config.get("gpus"),
+            "cpus_per_task": slurm_config.get("cpus_per_task", 4),
+            "mem": slurm_config.get("mem", "16G"),
+            "job_name": slurm_config.get("job_name", "rfdiffusion"),
+            "setup_lines": slurm_config.get("setup_lines", []),
+            "extra_sbatch_directives": slurm_config.get("extra_sbatch_directives", []),
+            "sbatch_executable": slurm_config.get("sbatch_executable", "sbatch"),
+        }
+        merged = {**defaults, **backend_kwargs}
+        if merged["inner_backend"] == "singularity" and not merged.get("image"):
+            raise ValueError(
+                "backend='slurm' with inner_backend='singularity' needs an 'image' (the .sif "
+                "path) — pass image=... directly, or set rfdiffusion.singularity_image in your "
+                "installation config."
+            )
+        return _submit_slurm(job, **merged)
+
     raise NotImplementedError(
-        f"backend {backend!r} is not implemented yet — 'local' and 'singularity' are available today. "
-        f"See external_tools_architecture.md for the planned slurm backend."
+        f"backend {backend!r} is not implemented yet — 'local', 'singularity', and 'slurm' are "
+        f"available today."
     )
 
 
@@ -604,6 +666,52 @@ def _submit_local(
         process = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd)
 
     return RFdiffusionRun(job=job, process=process, command=argv, log_path=log_path)
+
+
+def _build_singularity_argv(
+    job: RFdiffusionJob, image: str, executable: str = "singularity", run_mode: str = "run",
+    model_directory: Optional[str] = None, bind_paths: Sequence[str] = (), use_gpu: bool = True,
+) -> Tuple[List[str], RFdiffusionJob]:
+    """
+    Pure command-builder for the singularity execution style — factored
+    out of _submit_singularity() so _submit_slurm() can reuse the exact
+    same argv-construction logic (bind mounts, --nv, overrides) when
+    inner_backend="singularity", without duplicating it or coupling to
+    subprocess.Popen. Returns (argv, resolved_job) — resolved_job carries
+    the same absolute input_pdb/output_prefix actually baked into argv,
+    which callers need for their own RFdiffusionRun.job.
+
+    See _submit_singularity()'s docstring for why bind mounts use
+    identical host/container paths, and why "run --nv" (not "exec") is
+    the confirmed-correct invocation.
+    """
+    input_pdb_abs = os.path.abspath(job.input_pdb)
+    output_prefix_abs = os.path.abspath(job.output_prefix)
+
+    output_dir = os.path.dirname(output_prefix_abs)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    mount_dirs = {os.path.dirname(input_pdb_abs), output_dir}
+    model_directory_abs = os.path.abspath(model_directory) if model_directory else None
+    if model_directory_abs:
+        mount_dirs.add(model_directory_abs)
+    mount_dirs = sorted(d for d in mount_dirs if d)
+
+    argv = [executable, run_mode]
+    if use_gpu:
+        argv.append("--nv")
+    for d in mount_dirs:
+        argv += ["-B", f"{d}:{d}"]
+    for extra in bind_paths:
+        argv += ["-B", extra]
+    argv.append(image)
+    argv += _build_overrides(job, input_pdb=input_pdb_abs, output_prefix=output_prefix_abs)
+    if model_directory_abs:
+        argv.append(f"inference.model_directory_path={model_directory_abs}")
+
+    resolved_job = replace(job, input_pdb=input_pdb_abs, output_prefix=output_prefix_abs)
+    return argv, resolved_job
 
 
 def _submit_singularity(
@@ -633,40 +741,293 @@ def _submit_singularity(
         install the Apptainer fork under that name instead; both accept
         the same CLI.
     """
-    input_pdb_abs = os.path.abspath(job.input_pdb)
-    output_prefix_abs = os.path.abspath(job.output_prefix)
+    argv, resolved_job = _build_singularity_argv(
+        job, image, executable=executable, run_mode=run_mode,
+        model_directory=model_directory, bind_paths=bind_paths, use_gpu=use_gpu,
+    )
 
-    output_dir = os.path.dirname(output_prefix_abs)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    mount_dirs = {os.path.dirname(input_pdb_abs), output_dir}
-    model_directory_abs = os.path.abspath(model_directory) if model_directory else None
-    if model_directory_abs:
-        mount_dirs.add(model_directory_abs)
-    mount_dirs = sorted(d for d in mount_dirs if d)
-
-    argv = [executable, run_mode]
-    if use_gpu:
-        argv.append("--nv")
-    for d in mount_dirs:
-        argv += ["-B", f"{d}:{d}"]
-    for extra in bind_paths:
-        argv += ["-B", extra]
-    argv.append(image)
-    argv += _build_overrides(job, input_pdb=input_pdb_abs, output_prefix=output_prefix_abs)
-    if model_directory_abs:
-        argv.append(f"inference.model_directory_path={model_directory_abs}")
-
-    log_path = f"{output_prefix_abs}.log"
+    log_path = f"{resolved_job.output_prefix}.log"
     with open(log_path, "w") as log_file:
         process = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd)
 
     # RFdiffusionRun.job must carry the SAME output_prefix actually passed
     # to the container (the absolute path), or poll_status()'s glob would
     # look in the wrong place if job.output_prefix had been relative.
-    resolved_job = replace(job, input_pdb=input_pdb_abs, output_prefix=output_prefix_abs)
     return RFdiffusionRun(job=resolved_job, process=process, command=argv, log_path=log_path)
+
+
+# ============================================================================
+# SLURM backend
+# ============================================================================
+#
+# Design, verified directly against SchedMD's own sbatch/squeue/sacct
+# documentation (slurm.schedmd.com), not recalled from memory, and
+# cross-checked against prosculpt's own slurm_runner.py (a directly
+# comparable published RFdiffusion/HPC tool this module already cites
+# for its singularity conventions):
+#
+# - "slurm" is a SCHEDULING layer, not a third execution style: it wraps
+#   the exact same "local" (bare python) or "singularity" (container)
+#   command the other two backends would have run — inner_backend picks
+#   which — and instead of launching it directly via subprocess.Popen, it
+#   writes a real sbatch script file and submits THAT. This means the
+#   inner command is built by the SAME functions (build_command() /
+#   _build_singularity_argv()) either backend already uses, so there is
+#   exactly one place that knows how an RFdiffusionJob turns into a
+#   command, matching this module's own _build_overrides() precedent for
+#   "one function that knows the Hydra syntax, every backend reuses it."
+#
+# - A real .sh file is written and submitted via `sbatch <path>` (never
+#   `sbatch --wrap="..."` or subprocess with shell=True) — matching this
+#   module's established never-a-shell-string preference. Because a real
+#   shell script IS being written to disk here (unlike the argv-list
+#   subprocess.Popen calls elsewhere in this module), every inner argv
+#   token is run through shlex.quote() when rendered into the script, so
+#   RFdiffusion's contig syntax (square brackets, and the literal space
+#   in a chain-break token) survives intact instead of being re-split by
+#   bash.
+#
+# - Every partition/account/resource/module setting is entirely
+#   config-driven (rfdiffusion.slurm.* in installation.yaml) — nothing
+#   about a specific cluster is hardcoded, matching prosculpt's own
+#   slurm_runner.py, which takes the identical "read it all from YAML"
+#   approach for the same reason (there is no one-size-fits-all
+#   partition/gres convention across HPC sites).
+#
+# - ONE RFdiffusionJob submission = ONE sbatch job, generating all
+#   job.num_designs designs sequentially inside that single job (same
+#   inference.num_designs=N Hydra override the other backends use) —
+#   NOT a job array with one task per design. prosculpt's own
+#   slurm_runner.py uses a job array instead (one array task per design,
+#   for more parallelism across compute nodes), but that would need a
+#   fundamentally different RFdiffusionRun/poll_status() shape (tracking
+#   an array of job ids instead of one). Kept simple for now: one job id
+#   to poll, and poll_status()'s existing "count design PDBs on disk"
+#   logic keeps working completely unchanged. Array-based parallelism is
+#   a natural future enhancement if a single sequential job turns out
+#   too slow for large num_designs — see generate_msa()'s "deferred"
+#   precedent in pmpnn.py for how this project documents that kind of
+#   not-yet-built next step.
+#
+# - poll_status()/cancel() branch on RFdiffusionRun.slurm_job_id (None
+#   for local/singularity, set for slurm) rather than needing a
+#   subclass or a separate function — callers never need to know which
+#   backend produced the handle they're holding.
+
+
+def _render_sbatch_script(
+    inner_argv: Sequence[str], *, job_name: str, log_path: str,
+    partition: Optional[str] = None, account: Optional[str] = None, time: str = "04:00:00",
+    gres: Optional[str] = None, gpus: Optional[int] = None, cpus_per_task: int = 4, mem: str = "16G",
+    setup_lines: Sequence[str] = (), extra_sbatch_directives: Sequence[str] = (),
+    cd_to: Optional[str] = None,
+) -> str:
+    """
+    Renders a complete sbatch script as a string — a pure function
+    (no I/O) so its output is easy to unit-test without actually
+    submitting anything. See the "SLURM backend" section comment above
+    for the overall design.
+
+    #SBATCH directive semantics (partition/account/time/gres/gpus/
+    cpus-per-task/mem/job-name/output/error) confirmed directly against
+    slurm.schedmd.com/sbatch.html.
+
+    gres vs gpus : clusters differ on which GPU resource flag they
+    expect (older sites often use --gres=gpu:N, newer ones --gpus=N) —
+    both are accepted here and neither is assumed; pass whichever your
+    cluster wants (or both, or neither, if the partition itself is
+    GPU-only and needs no explicit request).
+
+    Every inner_argv token is shlex.quote()-d before being joined into
+    the script's command line — the ONE place in this module a real
+    shell string gets built, because sbatch has no argv-list equivalent
+    of subprocess.Popen(list); this restores the same "never let the
+    shell re-split our tokens" guarantee build_command()/
+    _build_singularity_argv() get for free from subprocess.Popen.
+    """
+    lines = ["#!/bin/bash"]
+    lines.append(f"#SBATCH --job-name={job_name}")
+    if partition:
+        lines.append(f"#SBATCH --partition={partition}")
+    if account:
+        lines.append(f"#SBATCH --account={account}")
+    lines.append(f"#SBATCH --time={time}")
+    if gres:
+        lines.append(f"#SBATCH --gres={gres}")
+    if gpus:
+        lines.append(f"#SBATCH --gpus={gpus}")
+    lines.append(f"#SBATCH --cpus-per-task={cpus_per_task}")
+    lines.append(f"#SBATCH --mem={mem}")
+    # stdout+stderr both go to log_path -- same single-combined-log
+    # convention _submit_local()/_submit_singularity() already use.
+    lines.append(f"#SBATCH --output={log_path}")
+    lines.append(f"#SBATCH --error={log_path}")
+    for directive in extra_sbatch_directives:
+        directive = directive if directive.startswith("--") or directive.startswith("-") else f"--{directive}"
+        lines.append(f"#SBATCH {directive}")
+
+    lines.append("")
+    lines.append("set -euo pipefail")
+    lines.append("")
+
+    if setup_lines:
+        lines.extend(setup_lines)
+        lines.append("")
+
+    if cd_to:
+        lines.append(f"cd {shlex.quote(cd_to)}")
+
+    lines.append(" ".join(shlex.quote(token) for token in inner_argv))
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+_SBATCH_JOB_ID_RE = re.compile(r"Submitted batch job (\d+)")
+
+
+def _submit_slurm(
+    job: RFdiffusionJob, inner_backend: str = "local",
+    # local-style inner command:
+    python_executable: str = "python", script_path: str = "scripts/run_inference.py",
+    repo_path: Optional[str] = None,
+    # singularity-style inner command:
+    image: Optional[str] = None, singularity_executable: str = "singularity",
+    model_directory: Optional[str] = None, bind_paths: Sequence[str] = (), use_gpu: bool = True,
+    # sbatch directives:
+    partition: Optional[str] = None, account: Optional[str] = None, time: str = "04:00:00",
+    gres: Optional[str] = None, gpus: Optional[int] = None, cpus_per_task: int = 4, mem: str = "16G",
+    job_name: str = "rfdiffusion", setup_lines: Sequence[str] = (),
+    extra_sbatch_directives: Sequence[str] = (), sbatch_executable: str = "sbatch",
+) -> RFdiffusionRun:
+    """
+    Submits `job` to a SLURM scheduler via sbatch. See this module's
+    "SLURM backend" section comment (above _render_sbatch_script) for the
+    full design rationale — short version: writes a real sbatch script
+    (never sbatch --wrap or a shell string), wrapping whichever inner
+    execution style (inner_backend="local" or "singularity") would have
+    been used directly by the other two backends, and submits it via
+    `sbatch <script_path>` as an argv list (never shell=True).
+
+    inner_backend="local" needs repo_path (RFdiffusion's own clone,
+    used both as the compute node's cwd and, via setup_lines, wherever
+    you'd `module load`/`source activate` its env). inner_backend=
+    "singularity" needs image (the .sif path) — same requirement
+    _submit_singularity() already has.
+
+    Raises RuntimeError immediately if sbatch itself fails to submit
+    (non-zero exit, or "Submitted batch job <N>" not found in its
+    stdout) — no RFdiffusionRun handle is returned for a submission
+    that never actually queued, rather than returning one that would
+    silently never progress.
+    """
+    output_prefix_abs = os.path.abspath(job.output_prefix)
+    input_pdb_abs = os.path.abspath(job.input_pdb)
+    resolved_job = replace(job, input_pdb=input_pdb_abs, output_prefix=output_prefix_abs)
+
+    output_dir = os.path.dirname(output_prefix_abs)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    if inner_backend == "local":
+        inner_argv = build_command(resolved_job, script_path=script_path, python_executable=python_executable)
+        cd_to = repo_path
+    elif inner_backend == "singularity":
+        if not image:
+            raise ValueError("_submit_slurm(inner_backend='singularity') needs image=... (the .sif path)")
+        inner_argv, resolved_job = _build_singularity_argv(
+            resolved_job, image, executable=singularity_executable,
+            model_directory=model_directory, bind_paths=bind_paths, use_gpu=use_gpu,
+        )
+        cd_to = None
+    else:
+        raise ValueError(f"inner_backend must be 'local' or 'singularity' — got {inner_backend!r}")
+
+    log_path = f"{output_prefix_abs}.log"
+    script_content = _render_sbatch_script(
+        inner_argv, job_name=job_name, log_path=log_path, partition=partition, account=account,
+        time=time, gres=gres, gpus=gpus, cpus_per_task=cpus_per_task, mem=mem,
+        setup_lines=setup_lines, extra_sbatch_directives=extra_sbatch_directives, cd_to=cd_to,
+    )
+    sbatch_script_path = f"{output_prefix_abs}.sbatch.sh"
+    with open(sbatch_script_path, "w") as f:
+        f.write(script_content)
+
+    result = subprocess.run(
+        [sbatch_executable, sbatch_script_path], capture_output=True, text=True,
+    )
+    match = _SBATCH_JOB_ID_RE.search(result.stdout or "")
+    if result.returncode != 0 or not match:
+        raise RuntimeError(
+            f"sbatch failed to submit {sbatch_script_path!r} (exit {result.returncode}) — "
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+    slurm_job_id = match.group(1)
+
+    return RFdiffusionRun(
+        job=resolved_job, process=None, command=inner_argv, log_path=log_path,
+        slurm_job_id=slurm_job_id, sbatch_script_path=sbatch_script_path,
+    )
+
+
+def _slurm_job_returncode(job_id: str, sacct_executable: str = "sacct", squeue_executable: str = "squeue") -> Optional[int]:
+    """
+    Returns None while `job_id` is still pending/running in the
+    scheduler's live queue, else its final exit code (0 for success).
+
+    Two-step, matching the standard SLURM wrapper pattern: `squeue -j
+    <id> -h -o %T` returns one state line (PENDING/RUNNING/COMPLETING/
+    etc.) while the job is still live, and EMPTY output once it has left
+    the queue entirely (completed, failed, cancelled, or timed out) —
+    confirmed against slurm.schedmd.com/squeue.html. Once squeue is
+    empty, `sacct -j <id> --format=State,ExitCode -n -P` is queried for
+    the job's final accounting record: sacct reports one line per job
+    STEP (e.g. "<id>|COMPLETED|0:0", "<id>.batch|COMPLETED|0:0",
+    "<id>.extern|COMPLETED|0:0" for a multi-step job) — only the line
+    for the bare job id itself (no ".batch"/".extern" suffix) reflects
+    the overall job's final state, which is what's read here (confirmed
+    against slurm.schedmd.com/sacct.html). ExitCode is "<code>:<signal>"
+    — the part before ":" is what's returned.
+
+    If sacct returns nothing at all for a job that has already left
+    squeue (e.g. accounting data expired, or sacct isn't configured on
+    this cluster — not every site enables it), this can't distinguish
+    "succeeded" from "failed" by exit code alone, so it falls back to
+    inferring success from whether every expected design PDB is already
+    on disk — the same signal poll_status() itself uses as its
+    OWN fallback for local/singularity. This is a last resort, not the
+    primary path: sacct being unavailable is uncommon on a real SLURM
+    deployment, worth confirming with your cluster admins if you hit it.
+    """
+    squeue_result = subprocess.run(
+        [squeue_executable, "-j", str(job_id), "-h", "-o", "%T"], capture_output=True, text=True,
+    )
+    if squeue_result.stdout.strip():
+        return None  # still PENDING/RUNNING/COMPLETING/etc.
+
+    # JobID has to be explicitly requested in --format (it's NOT implied by
+    # -j <id>) -- without it, the bare job's line and its .batch/.extern
+    # step lines are textually indistinguishable (all just "STATE|CODE:SIG"),
+    # so there'd be no reliable way to pick the right one.
+    sacct_result = subprocess.run(
+        [sacct_executable, "-j", str(job_id), "--format=JobID,State,ExitCode", "-n", "-P"],
+        capture_output=True, text=True,
+    )
+    for line in sacct_result.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) != 3:
+            continue
+        job_id_field, _state, exit_code = parts
+        # Only the line whose JobID field is EXACTLY job_id (no ".batch"/
+        # ".extern"/array-task suffix) reflects the overall job's final
+        # state -- a step sub-record's JobID always has a "." suffix.
+        if job_id_field != str(job_id):
+            continue
+        code = exit_code.split(":")[0]
+        if code.lstrip("-").isdigit():
+            return int(code)
+
+    return None  # sacct gave nothing usable -- caller (poll_status) falls back
 
 
 def poll_status(run: RFdiffusionRun) -> dict:
@@ -676,7 +1037,10 @@ def poll_status(run: RFdiffusionRun) -> dict:
     summary file (confirmed against scripts/run_inference.py), so
     progress is read the same way the tool itself resumes an interrupted
     run: by counting "{output_prefix}_<N>.pdb" files that have appeared
-    on disk.
+    on disk. For a "slurm" run (run.slurm_job_id is set), the exit
+    status comes from squeue/sacct (see _slurm_job_returncode()) instead
+    of a local subprocess handle; for "local"/"singularity", it's
+    run.process.poll() exactly as before.
 
     Returns a dict:
         state            : "running" | "completed" | "completed_partial" | "failed"
@@ -685,11 +1049,22 @@ def poll_status(run: RFdiffusionRun) -> dict:
         designs_expected : job.num_designs
         design_paths     : sorted list of the design PDB paths found so far
         log_path         : where RFdiffusion's own stdout/stderr is being captured
+        job              : the RFdiffusionJob that produced this run — see
+                            pmpnn.py's fixed_positions_from_contig_match()
     """
-    returncode = run.process.poll()
-
     pattern = re.compile(re.escape(run.job.output_prefix) + r"_\d+\.pdb$")
     design_paths = sorted(p for p in glob.glob(f"{run.job.output_prefix}_*.pdb") if pattern.search(p))
+
+    if run.slurm_job_id is not None:
+        returncode = _slurm_job_returncode(run.slurm_job_id)
+        if returncode is None and len(design_paths) >= run.job.num_designs:
+            # sacct gave no usable exit info (see _slurm_job_returncode()'s
+            # docstring) but every expected design is already on disk --
+            # same "trust the actual output" fallback poll_status() has
+            # always implicitly relied on for local/singularity too.
+            returncode = 0
+    else:
+        returncode = run.process.poll()
 
     if returncode is None:
         state = "running"
@@ -707,11 +1082,19 @@ def poll_status(run: RFdiffusionRun) -> dict:
         "designs_expected": run.job.num_designs,
         "design_paths": design_paths,
         "log_path": run.log_path,
+        # Carried through for parity with colab.import_colab_results()'s
+        # return shape -- see pmpnn.py's fixed_positions_from_contig_match().
+        "job": run.job,
     }
 
 
 def cancel(run: RFdiffusionRun) -> None:
     """Terminates a still-running job (e.g. behind a UI 'cancel' button)
-    — a no-op if it already finished."""
-    if run.process.poll() is None:
+    — a no-op if it already finished. For a "slurm" run, this calls
+    `scancel <job_id>` (safe to call on an already-finished job — SLURM
+    just reports it's not there); for "local"/"singularity", it
+    terminates the local subprocess exactly as before."""
+    if run.slurm_job_id is not None:
+        subprocess.run(["scancel", run.slurm_job_id], capture_output=True)
+    elif run.process is not None and run.process.poll() is None:
         run.process.terminate()

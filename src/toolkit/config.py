@@ -1,64 +1,106 @@
 """
-config.py — loads the per-user "where are your tools actually installed"
-settings (RFdiffusion's Singularity image path, GPU/bind-mount options,
-and later ProteinMPNN/AF3/Boltz equivalents), following the same split
-prosculpt's installation.yaml uses: a plain, gitignored YAML file holding
-YOUR machine's real paths, copied from a checked-in template.
+config.py — loads per-machine installation settings (tool repo paths,
+python executables, backend choice) out of ONE local YAML file, kept out
+of git.
 
-Deliberately plain YAML, not Hydra/OmegaConf: this project's own stated
-goal is a simple, accessible workflow, and Hydra's config-composition
-machinery is overkill for "here are a few file paths and flags."
-RFdiffusion's own CLI still speaks Hydra key=value overrides underneath
-(see rfdiffusion.py) — that's a property of the EXTERNAL tool, not
-something this project's own config needs to inherit.
+Why this exists
+----------------
+rfdiffusion.py and proteinmpnn.py both need to know things that are true
+for YOUR machine and nobody else's: where your local RFdiffusion/
+ProteinMPNN clone lives, which python/conda env has their dependencies,
+whether to run RFdiffusion via a Singularity image. None of that belongs
+hardcoded in the toolkit itself — it would break the moment anyone else
+clones the repo, or you move to a different machine or cluster.
+
+Simplicity is the whole design here: ONE file, installation.yaml, sitting
+in your project root next to pyproject.toml — gitignored, same convention
+prosculpt (a comparable published tool) uses for its own installation.yaml
+— with one top-level key per tool:
+
+    # installation.yaml
+    rfdiffusion:
+      backend: local                 # or "singularity"
+      repo_path: /home/you/RFdiffusion
+      python_executable: /home/you/miniconda3/envs/rfdiffusion/bin/python
+
+    proteinmpnn:
+      repo_path: /home/you/ProteinMPNN
+      python_executable: /home/you/miniconda3/envs/proteinmpnn/bin/python
+
+See installation.example.yaml (shipped alongside this file) for a
+fill-in-the-blanks starting point — copy it to installation.yaml and edit
+the two repo_path lines, that's the entire setup.
+
+Usage
+-----
+    from toolkit import config, proteinmpnn
+
+    cfg = config.load_installation_config()          # reads installation.yaml once
+    sequences_df = proteinmpnn.run("results.zip", config=cfg)
+
+Nothing here is required. Every submit()/run() function that accepts
+config=... also accepts the same settings directly as keyword arguments
+(repo_path=..., python_executable=...), and those always win over
+whatever the file has. config=None (the default everywhere) just means
+"use the function's own hardcoded fallback" — a fresh clone with no
+installation.yaml yet still works, you just have to pass repo_path=...
+by hand every call until you write the file.
 """
 
 import os
+from typing import Optional
 
-import yaml
+try:
+    import yaml
+except ImportError as exc:
+    raise ImportError(
+        "config.py needs PyYAML to read installation.yaml — install it with "
+        "`pip install pyyaml` (or add it to pyproject.toml/environment.yml)."
+    ) from exc
 
-DEFAULT_CONFIG_PATH = "installation.yaml"
-_TEMPLATE_NAME = "installation.yaml.template"
+# Name of the per-machine settings file. Lives in the project root (next
+# to pyproject.toml) — NOT inside the toolkit package — and must be
+# gitignored, since it's going to contain absolute paths specific to
+# whoever's machine it's sitting on.
+CONFIG_FILE_NAME = "installation.yaml"
 
 
-def load_installation_config(path: str = None) -> dict:
+def get_installation_config_path() -> str:
     """
-    Loads and returns the installation config as a plain dict, e.g.:
-
-        rfdiffusion:
-          backend: singularity
-          singularity_image: /home/user/containers/rfdiffusion.sif
-          singularity_executable: singularity   # or "apptainer" on some clusters
-          use_gpu: true
-          model_directory: /home/user/rfdiffusion_models   # optional
-          bind_paths: []                        # extra host:container mounts
-          python_executable: python              # only used for backend: local
-          script_path: scripts/run_inference.py  # only used for backend: local
-
-    Raises a clear, friendly error pointing at installation.yaml.template
-    if `path` doesn't exist yet — the same "copy the template, fill it
-    in" first-run experience prosculpt's own installation.yaml gives,
-    rather than a bare FileNotFoundError with no next step.
+    Absolute path to installation.yaml, resolved next to the current
+    working directory — same "lives in your project root, not some
+    hidden OS path" convention as download.py's temporary_files/ and
+    colab.py's temporary_simulations/.
     """
-    if path is None:
-        path = DEFAULT_CONFIG_PATH
+    return os.path.join(os.getcwd(), CONFIG_FILE_NAME)
+
+
+def load_installation_config(path: Optional[str] = None) -> dict:
+    """
+    Reads installation.yaml (or `path`, if given) into a plain dict —
+    this is the `config` argument rfdiffusion.submit()/proteinmpnn.run()
+    expect.
+
+    No file yet -> {} (NOT an error). Every tool's own get_tool_config()
+    call below already treats a missing section the same way, so a fresh
+    clone with no installation.yaml at all keeps working exactly as
+    before this file existed — you just pass repo_path=... explicitly
+    until you write one.
+    """
+    path = path or get_installation_config_path()
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"No installation config found at {path!r}. Copy {_TEMPLATE_NAME} to "
-            f"{path!r} (same folder) and fill in your machine's actual tool paths — "
-            f"see that file's comments for what each field means. "
-            f"{path!r} should stay out of version control (it's machine-specific)."
-        )
+        return {}
     with open(path) as f:
-        config = yaml.safe_load(f) or {}
-    return config
+        data = yaml.safe_load(f)
+    return data or {}
 
 
-def get_tool_config(config: dict, tool_name: str) -> dict:
+def get_tool_config(config: Optional[dict], tool_name: str) -> dict:
     """
-    Returns config[tool_name] as a plain dict, or {} if that tool has no
-    section yet — so callers can .get() sensible defaults freely instead
-    of a KeyError for a tool the user hasn't configured yet (e.g. no
-    ProteinMPNN section while only RFdiffusion is set up so far).
+    Pulls out one tool's own section (e.g. config["proteinmpnn"]),
+    defaulting to {} if that tool has no section yet (or config itself
+    is None/empty) — so every downstream `tool_config.get("repo_path")`
+    call just returns None instead of raising KeyError, and the caller's
+    own default takes over from there.
     """
-    return dict(config.get(tool_name) or {})
+    return (config or {}).get(tool_name) or {}

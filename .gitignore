@@ -4,5 +4,5 @@
 __pycache__/
 toolkit/temporary_files/
 toolkit/temporary_subunits/
-__pycache__/
-INSTALLATION/
+installation.yaml
+/ProteinMPNN/
