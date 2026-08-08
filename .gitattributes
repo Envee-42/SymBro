@@ -1,0 +1,4 @@
+# Normalize line endings to LF in the repository regardless of platform,
+# so a Windows checkout doesn't produce a false "changed every line" diff
+# against files committed with LF (as every file in this repo currently is).
+* text=auto eol=lf
