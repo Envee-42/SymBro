@@ -2,7 +2,10 @@
 .ipynb_checkpoints/
 .venv/
 __pycache__/
-toolkit/temporary_files/
-toolkit/temporary_subunits/
+/temporary_files/
+/temporary_subunits/
+/temporary_simulations/
 installation.yaml
 /ProteinMPNN/
+*.egg-info/
+*.zip
