@@ -39,7 +39,7 @@ module adds an extra guard the others don't need: submit() raises
 unless you explicitly pass terms_acknowledged=True (or set
 af3.terms_acknowledged: true in your installation config), so nobody
 runs an AF3 job without having actually seen this notice first. If
-symseeker is heading toward a commercial or bulk-served use, this
+SymBro is heading toward a commercial or bulk-served use, this
 backend specifically is very likely NOT usable for that under Google's
 current terms — alphafold2.py (CC BY 4.0 weights) and boltz.py (MIT,
 code and weights) don't have that problem. Get real legal review before

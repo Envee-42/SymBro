@@ -1033,7 +1033,7 @@ def _run_local(
     # this issue for its container backend.
     #
     # Separately: protein_mpnn_run.py's OWN auto-detection of where its model
-    # weights live is a confirmed Windows bug, not a symseeker bug — its
+    # weights live is a confirmed Windows bug, not a SymBro bug — its
     # source does `file_path.rfind("/")` against os.path.realpath(__file__)
     # with no `if k != -1` guard. On Windows, realpath returns a backslash
     # path with no "/" in it at all, so rfind returns -1, and

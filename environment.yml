@@ -2,11 +2,11 @@
 # gemmi/numpy/pandas/etc. from conda-forge than from PyPI wheels.
 #
 #   conda env create -f environment.yml
-#   conda activate symseeker
+#   conda activate symbro
 #
 # rcsb-api has no conda-forge package, so it (and the project itself,
 # in editable mode) are installed via pip inside the conda env.
-name: symseeker
+name: symbro
 channels:
   - conda-forge
 dependencies:

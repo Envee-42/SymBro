@@ -5,10 +5,10 @@ background job.
 
 RFdiffusion itself stays external (see external_tools_architecture.md):
 its install is heavy (CUDA-pinned conda env, SE(3)-Transformer, DGL) and
-deliberately NOT a dependency of this package. What symseeker owns is
+deliberately NOT a dependency of this package. What SymBro owns is
 everything AROUND the actual diffusion run: building its fiddly
 Hydra-config-override command correctly, generating its contig/hotspot
-syntax from data symseeker already has (rather than the user hand-typing
+syntax from data SymBro already has (rather than the user hand-typing
 "A1-150/20-30/B1-100"), and launching it in a way that never blocks the
 calling process — critical for a NiceGUI app, whose whole UI runs on one
 asyncio event loop.

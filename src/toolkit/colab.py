@@ -5,14 +5,14 @@ SLURM cluster is reachable (e.g. your institution's cluster is down).
 
 Why this is two plain functions and not a third submit() backend
 ------------------------------------------------------------------
-"local" and "singularity" both mean "Symseeker's own Python process spawns
+"local" and "singularity" both mean "SymBro's own Python process spawns
 a subprocess on a machine it already controls" — submit()/poll_status()
-work because that subprocess shares a filesystem with Symseeker, so
+work because that subprocess shares a filesystem with SymBro, so
 polling for output files to appear is meaningful.
 
 Colab is a different execution model entirely: it's a separate Jupyter
 notebook running on a Google-controlled machine, with its own filesystem
-and its own GPU. Symseeker cannot spawn it, cannot poll it, and cannot see
+and its own GPU. SymBro cannot spawn it, cannot poll it, and cannot see
 its output files appear on disk — there is a human in the loop, physically
 uploading a bundle in and downloading results back out. So instead of
 faking a backend that doesn't fit that shape, Colab support is two plain
@@ -40,7 +40,7 @@ so the run that happens inside the notebook is guaranteed to use the same
 contigs/hotspots/num_designs you already validated locally, never a
 hand-retyped copy that could drift.
 
-The companion notebook (symseeker_rfdiffusion_colab.ipynb, shipped
+The companion notebook (symbro_rfdiffusion_colab.ipynb, shipped
 alongside this file) is deliberately dumb: install RFdiffusion + weights
 once per Colab session, read job_manifest.json, run inference with its
 overrides verbatim, zip the outputs for download. All the "is this contig
@@ -130,12 +130,12 @@ def prepare_colab_bundle(job: RFdiffusionJob, bundle_dir: Optional[str] = None, 
     to be uploaded, as-is, to the companion notebook.
 
     Why a bundle instead of just handing Colab the job object: Colab's
-    filesystem is not Symseeker's filesystem, so job.input_pdb's real path
+    filesystem is not SymBro's filesystem, so job.input_pdb's real path
     (e.g. "temporary_subunits/ring_C3.pdb") means nothing there. The
     bundle copies the input PDB in under a fixed name and rewrites the
     Hydra overrides to point at that fixed name and a fixed, bundle-
     relative output_prefix — so the notebook never has to know, or guess,
-    any of Symseeker's own paths.
+    any of SymBro's own paths.
 
     bundle_dir defaults to a "<job-stem>_colab_bundle" folder INSIDE
     get_simulations_dir() (temporary_simulations/) rather than the current
@@ -218,7 +218,7 @@ def import_colab_results(job: RFdiffusionJob, downloaded_path: str, cleanup: boo
     needed anywhere downstream. The two differences: returncode is always
     None (there's no local subprocess exit code for a job that ran on
     someone else's machine) and log_path is always None (the notebook's
-    own output cells are that job's log, not a file Symseeker can reach).
+    own output cells are that job's log, not a file SymBro can reach).
     """
     if not os.path.exists(downloaded_path):
         raise FileNotFoundError(
