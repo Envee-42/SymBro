@@ -46,7 +46,7 @@ from toolkit import config, pmpnn, structure_prediction
 # Wherever pipeline.py's own "mpnn_run.job.out_folder" pointed — it's
 # the folder pipeline.py printed when it wrote "Wrote N sequences to
 # .../sequences.csv"; normally temporary_simulations/mpnn_designs/.
-MPNN_OUT_FOLDER = r"C:\Users\youruser\4_Projects\symbro\temporary_simulations\mpnn_designs"
+MPNN_OUT_FOLDER = r"C:\path\to\your\symbro\project\temporary_simulations\mpnn_designs"
 
 # Which predictor to screen with — "alphafold2", "boltz", or "af3" (see
 # structure_prediction.py's own module docstring for the licensing/setup
