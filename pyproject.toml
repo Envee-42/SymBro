@@ -23,6 +23,22 @@ dependencies = [
     "rich>=13.0",
 ]
 
+# RFdiffusion/ProteinMPNN/the structure-prediction backends themselves stay
+# OUT of the base dependencies on purpose -- see rfdiffusion.py's own module
+# docstring: their installs are heavy, and most of this package's own users
+# (anyone just running the query/download/geometry/isolate stages) never
+# touch them at all. proteinmpnn IS listed here, unlike the others, because
+# unlike RFdiffusion's CUDA-pinned/DGL/SE(3)-Transformer stack, ProteinMPNN
+# only needs plain torch (confirmed against dauparas/ProteinMPNN's own
+# source: device selection falls back to CPU automatically, no CUDA/GPU
+# required) -- light enough to offer as a real, installable extra rather
+# than a manual per-machine env someone has to assemble by hand. Install
+# with `pip install -e ".[proteinmpnn]"`; RFdiffusion and the structure-
+# prediction backends still need their own separately-managed environment,
+# pointed at via installation.yaml, same as before.
+[project.optional-dependencies]
+proteinmpnn = ["torch>=2.0"]
+
 [project.scripts]
 symbro = "toolkit.cli:app"
 

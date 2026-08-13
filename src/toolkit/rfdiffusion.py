@@ -46,7 +46,13 @@ Design, in short:
   chain_groups-style tuple (already in real physical ring order — see
   rings.py's own docstring on why chain_groups IS ring order) it
   generates the fixed/diffused-linker/fixed/... contig automatically, no
-  manual residue-range typing at all.
+  manual residue-range typing at all. Fusing 2+ originally-separate chains
+  also means relabeling/renumbering them onto one shared chain id first —
+  RFdiffusion's own contig grammar rejects a fused chain whose fixed
+  residues come from more than one original chain letter (confirmed
+  directly against RosettaCommons/RFdiffusion's source, via a real HPC
+  run) — see that function's own docstring and prepare_fusion_job(), which
+  handles this automatically.
 
 - submit() launches RFdiffusion via subprocess.Popen (never
   subprocess.run, which blocks the caller until the process exits) and
@@ -89,6 +95,7 @@ Design, in short:
 import glob
 import math
 import os
+import pickle
 import re
 import shlex
 import subprocess
@@ -96,6 +103,7 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import gemmi
+import numpy as np
 import pandas as pd
 
 from toolkit.config import get_tool_config
@@ -216,9 +224,134 @@ def build_contig_string(model: gemmi.Model, segments: Sequence[tuple]) -> str:
     return f"[{result}]"
 
 
+# RFdiffusion's own contig grammar cannot fuse fixed motif residues drawn
+# from more than one ORIGINAL chain letter into a single new output chain
+# -- confirmed directly against RosettaCommons/RFdiffusion's source, not
+# assumed: contigs.py's expand_sampled_mask() assigns exactly one new
+# output-chain letter per contig block that isn't ended with an explicit
+# "/0" break, and inference/model_runners.py's sample_init() then asserts
+# every FIXED residue within that one block shares a single original
+# chain id ("Error: Multiple chain IDs in chain: {...}") -- which a plain
+# head-to-tail fusion across chain_order (by construction) never does,
+# since each fixed segment comes from a different original chain. So
+# fusing chain_order into one new chain also means relabeling all of them
+# onto ONE shared chain id first, with residue numbers shifted so they
+# stay disjoint (gemmi/RFdiffusion address residues by (chain, resnum),
+# not by original biological chain identity, so this is safe) -- that's
+# what _fuse_chains_for_contig() below does, and what build_
+# linker_fusion_contig()'s returned fused_structure must be written to
+# disk and used as RFdiffusionJob.input_pdb for the returned contig
+# string's residue addresses to actually resolve. prepare_fusion_job()
+# handles all of this automatically.
+_MAX_FUSED_RESIDUE_NUMBER = 9999  # standard (non-hybrid36) PDB residue-number field is
+# a 4-digit fixed-width column. At or past this, gemmi's write_pdb() silently switches to
+# hybrid-36 encoding to keep fitting (e.g. residue 10001 -> "A001") -- which RFdiffusion's
+# own PDB parser (utils.py:parse_pdb_lines) does not understand: it does a plain int() on
+# that column and crashes with "invalid literal for int() with base 10: 'A001'". Confirmed
+# directly against a real HPC failure, not assumed -- _fuse_chains_for_contig() below must
+# never let the fused chain's residue numbering reach this ceiling.
+
+
+def _fuse_chains_for_contig(
+    model: gemmi.Model, chain_order: Sequence[str],
+) -> Tuple[gemmi.Structure, str, Dict[str, int]]:
+    """
+    Builds the actual structure build_linker_fusion_contig()'s contig
+    string has to be addressed against — see the module-level comment
+    above this function for WHY this exists.
+
+    Concatenates chain_order's chains, in order, into ONE new chain
+    (reusing chain_order[0] as its id, rather than inventing an unrelated
+    letter) — every chain after the first has its residue numbers shifted
+    up just far enough to start right after the previous chain's highest
+    fused residue number, so each original chain's numbers land in their
+    own disjoint range with no collisions, regardless of the source
+    file's own numbering, while keeping the fused chain's numbering as
+    tight as possible. Raises ValueError if the fused numbering would
+    still reach _MAX_FUSED_RESIDUE_NUMBER (see that constant's own
+    comment for why). Only polymer residues are carried over
+    (get_polymer(), matching this project's convention everywhere else
+    chains are copied — see isolate.py's _write_ring_structure).
+
+    Returns (fused_structure, fused_chain_id, chain_offsets) —
+    chain_offsets: {original_chain_name: offset_applied} lets a caller
+    translate any (chain_name, original_resnum) into fused_structure's own
+    numbering via `original_resnum + chain_offsets[chain_name]`. Used by
+    build_linker_fusion_contig() itself for the fixed-segment ranges, and
+    by prepare_fusion_job() to translate caller-supplied hotspot residues
+    the same way.
+
+    Raises KeyError (naming the offending chain) if any chain_order entry
+    isn't actually present in `model` — same contract
+    isolate.py's _write_ring_structure() uses for a missing chain. Raises
+    ValueError if a chain_order entry has no polymer residues to fuse, or
+    if the fused numbering would overflow _MAX_FUSED_RESIDUE_NUMBER.
+    """
+    fused_chain_id = chain_order[0]
+    fused = gemmi.Structure()
+    fused.name = "fused"
+    fused_model = gemmi.Model(model.num)
+    new_chain = gemmi.Chain(fused_chain_id)
+
+    chain_offsets: Dict[str, int] = {}
+    next_available = 1  # smallest fused residue number the next chain may start at
+    for chain_name in chain_order:
+        source_chain = model.find_chain(chain_name)
+        if source_chain is None:
+            raise KeyError(
+                f"chain {chain_name!r} (from chain_order {tuple(chain_order)!r}) not found in "
+                f"structure — available chains: {[c.name for c in model]}"
+            )
+        residues = list(source_chain.get_polymer())
+        if not residues:
+            raise ValueError(
+                f"chain {chain_name!r} (from chain_order {tuple(chain_order)!r}) has no polymer "
+                f"residues to fuse."
+            )
+
+        resnums = [residue.seqid.num for residue in residues]
+        offset = next_available - min(resnums)
+        chain_offsets[chain_name] = offset
+        for residue in residues:
+            new_residue = residue.clone()
+            new_residue.seqid.num = residue.seqid.num + offset
+            # Each residue's cloned subchain tag is still the SOURCE
+            # chain's own (e.g. "Bxp" for something copied from chain B) —
+            # left as-is, setup_entities() below treats the large jump in
+            # residue numbers between chains as a subchain boundary and
+            # get_polymer() then only returns the first subchain it finds,
+            # silently dropping every other original chain's residues.
+            # Confirmed directly (not assumed): clearing it lets
+            # setup_entities() assign one consistent subchain across the
+            # whole fused chain instead, so get_polymer() -- what every
+            # other function in this module reads chain contents through
+            # (_chain_residue_range, _validate_fixed_segment, etc.) --
+            # sees the complete, correctly fused chain.
+            new_residue.subchain = ""
+            new_chain.add_residue(new_residue)
+
+        next_available = max(resnums) + offset + 1
+
+    if next_available - 1 >= _MAX_FUSED_RESIDUE_NUMBER:
+        raise ValueError(
+            f"Fusing chains {tuple(chain_order)!r} needs fused residue numbers up to "
+            f"{next_available - 1}, at or past the standard PDB format's 4-digit limit "
+            f"({_MAX_FUSED_RESIDUE_NUMBER}). gemmi would silently hybrid-36-encode these "
+            f"when writing the PDB (e.g. 10001 -> 'A001'), which RFdiffusion's own parser "
+            f"cannot read -- this would fail on the cluster with a cryptic ValueError, so "
+            f"it's caught here instead. This combination of ring subunits is too large to "
+            f"fuse into one PDB-numbered chain."
+        )
+
+    fused_model.add_chain(new_chain)
+    fused.add_model(fused_model)
+    fused.setup_entities()
+    return fused, fused_chain_id, chain_offsets
+
+
 def build_linker_fusion_contig(
     model: gemmi.Model, chain_order: Sequence[str], linker_length: Union[int, Tuple[int, int]],
-) -> str:
+) -> Tuple[str, gemmi.Structure, Dict[str, int]]:
     """
     Direct answer to "design new fusions": builds a fixed/diffused-linker/
     fixed/.../fixed contig across chain_order, with a diffused linker of
@@ -238,11 +371,29 @@ def build_linker_fusion_contig(
 
     Each chain's own fixed residue range is read directly from `model`'s
     actual resolved auth_seq_id numbering — nothing is typed by hand.
+    Fusing more than one original chain requires relabeling/renumbering
+    them onto one shared chain id first (see the module-level comment
+    above _fuse_chains_for_contig() for why) — this function does that
+    via _fuse_chains_for_contig() and returns the result alongside the
+    contig string, since the string's own residue addresses are only
+    valid against that new, fused structure — NOT against `model` as
+    originally passed in.
 
-    Returns the bracketed contig string, ready for
-    RFdiffusionJob(contigs=...). Use build_contig_string directly (with
-    an explicit ("break",) segment) instead if you want chains kept as
-    SEPARATE output chains rather than fused into one.
+    Returns (contig_string, fused_structure, chain_offsets):
+      contig_string  : ready for RFdiffusionJob(contigs=...), but ONLY
+                        valid when RFdiffusionJob.input_pdb points at
+                        fused_structure written to disk — not at whatever
+                        file `model` itself came from.
+      fused_structure: see _fuse_chains_for_contig()'s docstring.
+      chain_offsets  : see _fuse_chains_for_contig()'s docstring — needed
+                        to translate hotspot residues into the same fused
+                        numbering (prepare_fusion_job() does this).
+
+    Use build_contig_string directly (with an explicit ("break",) segment)
+    instead if you want chains kept as SEPARATE output chains rather than
+    fused into one — that case has no chain-identity conflict, since each
+    output chain then only ever contains fixed residues from one original
+    chain, so none of the above applies.
     """
     if len(chain_order) < 2:
         raise ValueError(f"chain_order needs at least 2 chains to build a fusion linker between them — got {tuple(chain_order)!r}")
@@ -252,14 +403,19 @@ def build_linker_fusion_contig(
     else:
         min_len = max_len = linker_length
 
+    fused_structure, fused_chain_id, chain_offsets = _fuse_chains_for_contig(model, chain_order)
+    fused_model = fused_structure[0]
+
     segments = []
     for i, chain_name in enumerate(chain_order):
         start, end = _chain_residue_range(model, chain_name)
-        segments.append(("fixed", chain_name, start, end))
+        offset = chain_offsets[chain_name]
+        segments.append(("fixed", fused_chain_id, start + offset, end + offset))
         if i < len(chain_order) - 1:
             segments.append(("diffuse", min_len, max_len))
 
-    return build_contig_string(model, segments)
+    contig = build_contig_string(fused_model, segments)
+    return contig, fused_structure, chain_offsets
 
 
 def _chain_residue_range(model: gemmi.Model, chain_name: str) -> Tuple[int, int]:
@@ -404,9 +560,18 @@ def prepare_fusion_job(
         run = rfdiffusion.submit(job)
 
     Reads `ring_pdb_path` once with gemmi, then builds the fixed/diffused
-    fusion contig across chain_order (build_linker_fusion_contig) and, if
-    given, the hotspot string (build_hotspot_string) against that same
-    parsed structure, so both are validated together in one pass.
+    fusion contig across chain_order (build_linker_fusion_contig). Fusing
+    2+ original chains requires relabeling/renumbering them onto one
+    shared chain id first — see build_linker_fusion_contig()'s own
+    docstring for why RFdiffusion's contig grammar requires this — so this
+    also writes a SECOND pdb, "<stem>_fused_input.pdb", next to output_dir,
+    holding that relabeled structure; RFdiffusionJob.input_pdb points at
+    THAT file, not ring_pdb_path, since the contig string's residue
+    addresses are only valid against the fused numbering. If given,
+    hotspots (chain, resnum) tuples — expected in ring_pdb_path's ORIGINAL
+    chain_order-relative numbering, same convention as chain_order itself
+    — are translated through the same offsets before build_hotspot_string
+    validates them against the fused structure.
 
     output_dir defaults to an "rfdiffusion_designs" folder next to
     ring_pdb_path itself — same workspace-visible-scratch-folder
@@ -421,14 +586,27 @@ def prepare_fusion_job(
     structure = gemmi.read_structure(ring_pdb_path)
     model = structure[0]
 
-    contigs = build_linker_fusion_contig(model, chain_order, linker_length)
-    hotspot_res = build_hotspot_string(model, hotspots) if hotspots else None
+    contigs, fused_structure, chain_offsets = build_linker_fusion_contig(model, chain_order, linker_length)
 
     stem = os.path.splitext(os.path.basename(ring_pdb_path))[0]
+    fused_input_path = os.path.join(output_dir, f"{stem}_fused_input.pdb")
+    fused_structure.write_pdb(fused_input_path)
+
+    hotspot_res = None
+    if hotspots:
+        fused_chain_id = chain_order[0]
+        bad = [(chain, resnum) for chain, resnum in hotspots if chain not in chain_offsets]
+        if bad:
+            raise ValueError(
+                f"hotspot(s) reference chain(s) not in chain_order {tuple(chain_order)!r}: {bad}"
+            )
+        translated_hotspots = [(fused_chain_id, resnum + chain_offsets[chain]) for chain, resnum in hotspots]
+        hotspot_res = build_hotspot_string(fused_structure[0], translated_hotspots)
+
     output_prefix = os.path.join(output_dir, stem)
 
     return RFdiffusionJob(
-        input_pdb=ring_pdb_path, output_prefix=output_prefix, contigs=contigs,
+        input_pdb=fused_input_path, output_prefix=output_prefix, contigs=contigs,
         hotspot_res=hotspot_res, num_designs=num_designs, diffuser_T=diffuser_T,
         extra_overrides=dict(extra_overrides or {}),
     )
@@ -871,7 +1049,19 @@ def _render_sbatch_script(
     lines.append("")
 
     if setup_lines:
+        # setup_lines is arbitrary user-supplied shell (conda/module
+        # activation scripts, typically) -- those commonly reference
+        # variables that are legitimately unset at this point (e.g. an
+        # unset $PS1 in a non-interactive shell, conda's own activation
+        # script checking unset env vars), which crashes immediately
+        # under the nounset mode set -euo pipefail just turned on above.
+        # Suspend -u around setup_lines only, then restore it before the
+        # actual job command runs, so a nounset bug in the job command
+        # itself still fails loudly while activation scripts get the
+        # permissive shell they were written to expect.
+        lines.append("set +u")
         lines.extend(setup_lines)
+        lines.append("set -u")
         lines.append("")
 
     if cd_to:
@@ -1098,3 +1288,85 @@ def cancel(run: RFdiffusionRun) -> None:
         subprocess.run(["scancel", run.slurm_job_id], capture_output=True)
     elif run.process is not None and run.process.poll() is None:
         run.process.terminate()
+
+
+# ============================================================================
+# Design scoring — RFdiffusion's own per-design confidence, so a design (or
+# a person, or a future NiceGUI panel) can choose which design(s) are worth
+# carrying forward into ProteinMPNN instead of feeding it everything blindly.
+# ============================================================================
+#
+# RFdiffusion's .trb file (written by scripts/run_inference.py, one per
+# design next to its .pdb) has exactly four guaranteed keys — confirmed
+# directly against RosettaCommons/RFdiffusion's own source, not assumed:
+# "config", "plddt", "device", "time" (plus whatever contig-mapping keys
+# sampler.contig_map.get_mappings() contributes, when available). Notably,
+# the "Sampled motif RMSD" value printed during sampling
+# (rfdiffusion/inference/utils.py's align_to_xt_motif()) is ONLY ever
+# logged via self._log.info() — never returned or saved anywhere — so it
+# is NOT something that can be read back from the .trb, despite that being
+# a natural first guess. "plddt" — an (n_timesteps, n_residues) array of
+# RFdiffusion's own per-residue confidence at every denoising step — is
+# therefore the only structured, reliable per-design signal available here.
+
+def _load_design_score(trb_path: str) -> dict:
+    """Reads one RFdiffusion .trb file and reduces its "plddt" array to a
+    single-design summary, using the FINAL denoising timestep's row
+    (index -1) — earlier timesteps are intermediate/noisy by
+    construction, so only the fully-denoised structure's confidence is
+    meaningful for comparing designs against each other."""
+    with open(trb_path, "rb") as f:
+        trb = pickle.load(f)
+    final_plddt = np.asarray(trb["plddt"])[-1]
+    return {
+        "trb_path": trb_path,
+        "mean_plddt": float(final_plddt.mean()),
+        "min_plddt": float(final_plddt.min()),
+    }
+
+
+def rank_designs(
+    design_paths: Sequence[str], top_n: Optional[int] = None, min_plddt: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Ranks RFdiffusion designs by the model's own final-timestep mean
+    pLDDT (see the module comment above, and _load_design_score()) —
+    highest (most confident) first. Each design's .trb is expected
+    alongside its .pdb with the same basename, RFdiffusion's own
+    run_inference.py convention — poll_status()'s own design_paths are
+    already in this shape.
+
+    With neither top_n nor min_plddt given, returns every design ranked
+    — that IS the "let the user choose" feature: show the full table (a
+    CLI table today, a sortable NiceGUI grid later) and let a person pick
+    by eye, rather than only ever offering a fixed automatic cutoff.
+    top_n/min_plddt are a convenience default layered on the same
+    ranking, not a replacement for showing it.
+
+    Returns a DataFrame (design_path, trb_path, mean_plddt, min_plddt),
+    best first — pass its "design_path" column (in full, or narrowed
+    however you like) straight into pmpnn.prepare_mpnn_job()/pmpnn.run().
+    Raises FileNotFoundError (naming the missing .trb) if any
+    design_paths entry doesn't have one alongside it — scoring can't
+    proceed without it.
+    """
+    rows = []
+    for pdb_path in design_paths:
+        trb_path = os.path.splitext(pdb_path)[0] + ".trb"
+        if not os.path.exists(trb_path):
+            raise FileNotFoundError(
+                f"no .trb file found alongside {pdb_path!r} (expected {trb_path!r}) — "
+                f"RFdiffusion writes one .trb per design next to its .pdb, and rank_designs() "
+                f"needs it to read that design's own pLDDT."
+            )
+        score = _load_design_score(trb_path)
+        score["design_path"] = pdb_path
+        rows.append(score)
+
+    df = pd.DataFrame(rows, columns=["design_path", "trb_path", "mean_plddt", "min_plddt"])
+    df = df.sort_values("mean_plddt", ascending=False).reset_index(drop=True)
+    if min_plddt is not None:
+        df = df[df["mean_plddt"] >= min_plddt].reset_index(drop=True)
+    if top_n is not None:
+        df = df.head(top_n).reset_index(drop=True)
+    return df
