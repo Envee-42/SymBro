@@ -62,6 +62,8 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import gemmi
 import pandas as pd
 
+from toolkit.paths import resolve_path, to_portable
+
 
 TEMP_SUBUNITS_DIR_NAME: str = "temporary_subunits"
 
@@ -148,8 +150,15 @@ def _short_chain_id(index: int) -> str:
 
 def _load_single_model(filepath: str) -> Tuple[gemmi.Structure, gemmi.Model]:
     """Reads `filepath` and drops every model but the first — the same
-    single-model assumption rings.py/orientation.py/structure.py make."""
-    structure = gemmi.read_structure(filepath)
+    single-model assumption rings.py/orientation.py/structure.py make.
+
+    `filepath` may be relative (as stored in a checkpoint's filepath
+    column -- e.g. rings.pkl, or downloaded.pkl if this is reading a
+    source assembly directly -- see paths.py) or absolute (older
+    checkpoints, or a caller-supplied path); resolved to absolute here,
+    the single point every filepath this module reads passes through.
+    """
+    structure = gemmi.read_structure(resolve_path(filepath))
     while len(structure) > 1:
         del structure[-1]
     return structure, structure[0]
@@ -305,7 +314,15 @@ def isolate_assembly_rings(
             "assembly_id": row_assembly_id,
             "symmetry_type": symmetry_type,
             "chain_groups": chain_group,
-            "filepath": written_path,
+            # Stored relative to the current working directory (see
+            # paths.py) so rings.pkl survives a move to another machine --
+            # resolved back to absolute by _load_single_model() (and, for
+            # any downstream consumer, e.g. rfdiffusion.py, automatically
+            # via the normal OS relative-path-resolves-against-CWD
+            # behavior, since that's exactly the same convention this
+            # whole pipeline already relies on for state_dir/data_dir/
+            # output_dir).
+            "filepath": to_portable(written_path),
             "chain_rename_map": rename_map,
         })
 

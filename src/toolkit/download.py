@@ -16,6 +16,8 @@ import shutil
 import requests
 import pandas as pd
 
+from toolkit.paths import resolve_path, to_portable
+
 
 # RCSB's download URL pattern for a specific biological assembly, gzip-compressed.
 # {pdb_id} must be lowercase for this endpoint to resolve correctly.
@@ -81,7 +83,11 @@ def build_download_table(assembly_ids, data_dir=None):
             "assembly_id": assembly_id,
             "entry_id": entry_id,
             "assembly_num": assembly_num,
-            "filepath": os.path.join(data_dir, f"{entry_id}-assembly{assembly_num}.cif"),
+            # Stored relative to the current working directory (see
+            # paths.py) so downloaded.pkl survives a move to another
+            # machine -- resolved back to absolute wherever it's actually
+            # used for file I/O (download_structure(), save_structures()).
+            "filepath": to_portable(os.path.join(data_dir, f"{entry_id}-assembly{assembly_num}.cif")),
             # RCSB's download endpoint requires the PDB code in lowercase —
             # note this is ONLY applied here, for the URL. The filepath above
             # keeps entry_id in its original case, so your files on disk stay
@@ -136,9 +142,9 @@ def add_download_columns(df, id_column="entry_id", assembly_column="assembly_num
         df[assembly_column] = parsed.apply(lambda pair: pair[1])
 
     df["filepath"] = df.apply(
-        lambda row: os.path.join(
+        lambda row: to_portable(os.path.join(
             data_dir, f"{row[id_column]}-assembly{row[assembly_column]}.cif"
-        ),
+        )),
         axis=1,
     )
     df["url"] = df.apply(
@@ -158,7 +164,13 @@ def download_structure(filepath, url, overwrite=False):
     overwrite : if False (default) and filepath already exists, skips the
         download entirely — safe to re-run a download loop repeatedly
         without re-fetching everything each time.
+
+    `filepath` may be relative (as stored in downloaded.pkl -- see
+    paths.py) or absolute (older checkpoints, or a caller-supplied path);
+    resolved to absolute here, right before it's actually used, either way.
     """
+    filepath = resolve_path(filepath)
+
     if os.path.exists(filepath) and not overwrite:
         return filepath
 
@@ -238,6 +250,7 @@ def save_structures(df, destination, filepath_column="filepath"):
     os.makedirs(destination, exist_ok=True)
     saved_paths = []
     for filepath in df[filepath_column]:
+        filepath = resolve_path(filepath)  # may be stored relative -- see paths.py
         dest_path = os.path.join(destination, os.path.basename(filepath))
         shutil.copy2(filepath, dest_path)  # copy2 preserves file metadata (timestamps etc.)
         saved_paths.append(dest_path)

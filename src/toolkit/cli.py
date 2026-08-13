@@ -19,6 +19,7 @@ a small ".symbro/" folder in your current directory) -- run `symbro
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import typer
@@ -61,6 +62,17 @@ def main(
     ),
 ):
     ctx.obj = {"state_dir": state_dir}
+    # Every default path in this pipeline (state_dir, and download's/
+    # isolate's own data_dir/output_dir defaults) resolves relative to
+    # os.getcwd() -- i.e. the whole CLI already assumes you run `symbro`
+    # from your project root. Echoing the resolved absolute paths here
+    # makes that assumption visible and checkable (e.g. in a cluster batch
+    # job's log) instead of silent -- see paths.py for why checkpoints
+    # rely on it holding at command-invocation time only, not beyond.
+    if ctx.invoked_subcommand is not None:
+        console.print(
+            f"[dim]Working from: {os.getcwd()}  (state dir: {os.path.abspath(state_dir)})[/dim]"
+        )
 
 
 def _fail(message: str) -> "typer.NoReturn":
