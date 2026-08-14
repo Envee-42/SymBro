@@ -203,6 +203,24 @@ def get_simulations_dir() -> str:
     return path
 
 
+def clear_simulations_dir(data_dir: Optional[str] = None) -> None:
+    """Deletes everything INSIDE temporary_simulations/ (or a custom
+    data_dir) but keeps the folder itself -- same "easy to empty, stays
+    ready to use" behavior as download.py's clear_temp_dir() / isolate.py's
+    clear_temp_subunits_dir()."""
+    if data_dir is None:
+        data_dir = get_simulations_dir()
+
+    for entry in os.listdir(data_dir):
+        if entry.startswith('.'):
+            continue
+        entry_path = os.path.join(data_dir, entry)
+        if os.path.isfile(entry_path) or os.path.islink(entry_path):
+            os.remove(entry_path)
+        else:
+            shutil.rmtree(entry_path)
+
+
 # ============================================================================
 # Turning "whatever RFdiffusion produced" into a plain list of .pdb paths
 # ============================================================================
@@ -1015,6 +1033,47 @@ def submit(
     )
 
 
+def _conda_env_lib_dir(python_executable: str) -> Optional[str]:
+    """
+    Best-effort guess at a conda/venv environment's own lib/ directory
+    from its python executable's path (<env_root>/bin/python ->
+    <env_root>/lib) -- mirrors rfdiffusion.py's function of the same
+    name; duplicated here rather than imported since it's a small, self-
+    contained helper and this module already stands alone from
+    rfdiffusion.py everywhere else. See that copy's docstring for the
+    full rationale: a compiled extension inside the env (here: torch)
+    can need a newer libstdc++ than whatever the CALLING shell's own
+    LD_LIBRARY_PATH already points at, and unlike rfdiffusion.py's SLURM
+    backend, ProteinMPNN is ALWAYS invoked via a bare subprocess (see
+    module docstring: "LOCAL ONLY") with no shell in between -- so
+    `conda activate` never runs and $CONDA_PREFIX is never set, meaning
+    this is the ONLY way to fix this for ProteinMPNN, not just the most
+    convenient one.
+
+    Returns None if python_executable doesn't look like a
+    <env_root>/bin/python layout, or that env_root has no lib/ directory.
+    """
+    bin_dir = os.path.dirname(os.path.abspath(python_executable))
+    if os.path.basename(bin_dir) != "bin":
+        return None
+    lib_dir = os.path.join(os.path.dirname(bin_dir), "lib")
+    return lib_dir if os.path.isdir(lib_dir) else None
+
+
+def _local_subprocess_env(python_executable: str) -> Optional[dict]:
+    """Environment dict for a locally-invoked python_executable subprocess
+    -- see rfdiffusion.py's function of the same name. None (a no-op --
+    subprocess.Popen/run's own default is to inherit the parent's
+    environment unchanged) if _conda_env_lib_dir() found nothing to add."""
+    lib_dir = _conda_env_lib_dir(python_executable)
+    if lib_dir is None:
+        return None
+    env = dict(os.environ)
+    existing = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else lib_dir
+    return env
+
+
 def _run_local(
     job: ProteinMPNNJob, script_path: str = "protein_mpnn_run.py",
     parse_script_path: str = "helper_scripts/parse_multiple_chains.py",
@@ -1075,8 +1134,11 @@ def _run_local(
         python_executable=python_executable, parse_script_path=parse_script_path,
     )
     parse_log_path = os.path.join(_job_work_dir(job), "parse.log")
+    local_env = _local_subprocess_env(python_executable)
     with open(parse_log_path, "w") as log_file:
-        parse_result = subprocess.run(parse_argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd)
+        parse_result = subprocess.run(
+            parse_argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd, env=local_env,
+        )
     if parse_result.returncode != 0 or not os.path.exists(jsonl_path):
         raise RuntimeError(
             f"parse_multiple_chains.py failed (exit {parse_result.returncode}) — see "
@@ -1102,10 +1164,12 @@ def _run_local(
     )
 
     # subprocess.Popen (never subprocess.run/check_call, which block until
-    # the child exits) so this returns immediately.
+    # the child exits) so this returns immediately. env=local_env (same
+    # dict computed above for the parse step) fixes the GLIBCXX-shadowing
+    # class of bug described in _conda_env_lib_dir()'s docstring.
     log_path = os.path.join(job.out_folder, "proteinmpnn.log")
     with open(log_path, "w") as log_file:
-        process = subprocess.Popen(mpnn_argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd)
+        process = subprocess.Popen(mpnn_argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd, env=local_env)
 
     return ProteinMPNNRun(
         job=job, process=process, command=mpnn_argv, log_path=log_path,

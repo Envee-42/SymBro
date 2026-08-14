@@ -7,10 +7,15 @@ folder convention every command below relies on.
 
 Typical workflow, run in order:
 
-    symbro query       search RCSB PDB for candidate assemblies
-    symbro download    download the matching structure files
-    symbro geometry    detect symmetry rings (and orientation/termini for one type)
-    symbro isolate     extract each ring's PDB, ready for RFdiffusion
+    symbro query         search RCSB PDB for candidate assemblies
+    symbro download      download the matching structure files
+    symbro geometry      detect symmetry rings (and orientation/termini for one type)
+    symbro isolate       extract each ring's PDB, ready for RFdiffusion
+    symbro rfdiffusion   submit RFdiffusion, one job per assembly (blocks until done
+                         unless --detach, which needs backend='slurm')
+    symbro status        check on --detach'd RFdiffusion jobs
+    symbro pmpnn         run ProteinMPNN against each assembly's best design(s)
+    symbro clean         clear scratch files + checkpoints between runs
 
 Each command picks up automatically where the previous one left off (via
 a small ".symbro/" folder in your current directory) -- run `symbro
@@ -302,7 +307,196 @@ def isolate(
     _summarize(df, empty_hint="Try a different --symmetry-type, or check `symbro geometry`'s output.")
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/rings.pkl[/cyan] (preview: rings.csv)")
-        console.print("  RFdiffusion + ProteinMPNN + prediction commands are coming in the next round.")
+        console.print("  Next: [bold]symbro rfdiffusion[/bold]")
+
+
+@app.command()
+def rfdiffusion(
+    ctx: typer.Context,
+    assembly_id: Optional[str] = typer.Option(
+        None, help="Only submit this assembly's ring (default: every row in rings.pkl)."
+    ),
+    linker_min: int = typer.Option(15, help="Diffused linker min length (residues)."),
+    linker_max: int = typer.Option(25, help="Diffused linker max length (residues)."),
+    num_designs: int = typer.Option(10, help="How many designs each assembly's job should produce."),
+    diffuser_t: int = typer.Option(50, "--diffuser-t", help="RFdiffusion's diffuser.T (noise steps)."),
+    backend: Optional[str] = typer.Option(
+        None, help="'local', 'singularity', or 'slurm' -- default: installation.yaml's "
+                    "rfdiffusion.backend, or 'local' if that isn't set either."
+    ),
+    detach: bool = typer.Option(
+        False, "--detach", help="Submit and return immediately instead of blocking until done -- "
+                                 "only works with backend='slurm'. Check progress later with "
+                                 "`symbro status`."
+    ),
+    poll_interval: int = typer.Option(20, help="Seconds between status checks while blocking."),
+    timeout: Optional[int] = typer.Option(
+        None, help="Give up waiting after this many seconds (default: no timeout, wait until done). "
+                    "The job(s) keep running regardless; SLURM jobs stay checkable via `symbro "
+                    "status` afterward, local/singularity jobs may not (see the warning if it happens)."
+    ),
+):
+    """Submit RFdiffusion -- one job per assembly in `symbro isolate`'s output."""
+    try:
+        df = pipeline.run_rfdiffusion(
+            assembly_id=assembly_id, linker_length=(linker_min, linker_max),
+            num_designs=num_designs, diffuser_T=diffuser_t, backend=backend,
+            detach=detach, poll_interval=poll_interval, timeout=timeout,
+            state_dir=ctx.obj["state_dir"],
+        )
+    except pipeline.StageNotFoundError as exc:
+        _fail(str(exc))
+    except (ValueError, RuntimeError) as exc:
+        _fail(f"RFdiffusion submission failed: {exc}")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"RFdiffusion failed: {exc}")
+
+    console.print(f"[bold green]✓[/bold green] {len(df)} job(s) submitted.")
+    if not df.empty:
+        # Skip the raw "run" column in the preview -- it's an
+        # RFdiffusionRun dataclass, and _format_cell()'s generic str()
+        # fallback would dump its full, noisy repr into every cell.
+        preview = df.copy()
+        preview["slurm_job_id"] = preview["run"].apply(lambda r: r.slurm_job_id or "—")
+        preview["designs_written"] = preview["design_paths"].apply(len)
+        preview = preview[["assembly_id", "symmetry_type", "state", "slurm_job_id", "designs_written"]]
+        _summarize(preview, empty_hint="")
+    else:
+        _summarize(df, empty_hint="")
+    if not df.empty:
+        console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/rfdiffusion.pkl[/cyan] (preview: rfdiffusion.csv)")
+        if detach:
+            console.print("  Next: [bold]symbro status[/bold] to check progress, then "
+                           "[bold]symbro pmpnn[/bold] once done.")
+        else:
+            console.print("  Next: [bold]symbro pmpnn[/bold]")
+
+
+@app.command()
+def status(ctx: typer.Context):
+    """Check on --detach'd RFdiffusion jobs and refresh their status."""
+    try:
+        df = pipeline.run_status(state_dir=ctx.obj["state_dir"])
+    except pipeline.StageNotFoundError as exc:
+        _fail(str(exc))
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"Status check failed: {exc}")
+
+    still_running = df[~df["state"].isin(["completed", "completed_partial", "failed"])]
+    console.print(
+        f"[bold green]✓[/bold green] {len(df)} RFdiffusion job(s) tracked, "
+        f"{len(still_running)} still running."
+    )
+    preview = df[["assembly_id", "symmetry_type", "state", "design_paths"]].copy()
+    preview["design_paths"] = preview["design_paths"].apply(len)
+    preview = preview.rename(columns={"design_paths": "designs_written"})
+    _summarize(preview, empty_hint="")
+    if still_running.empty and not df.empty:
+        console.print("  All jobs done. Next: [bold]symbro pmpnn[/bold]")
+
+
+@app.command()
+def pmpnn(
+    ctx: typer.Context,
+    assembly_id: Optional[str] = typer.Option(
+        None, help="Only run this assembly (default: every completed row in rfdiffusion.pkl)."
+    ),
+    top_n: int = typer.Option(1, help="Submit only the top N RFdiffusion designs per assembly, by pLDDT."),
+    min_plddt: Optional[float] = typer.Option(None, help="Also require at least this mean pLDDT."),
+    select: Optional[List[str]] = typer.Option(
+        None, "--select", help="Explicit design PDB path (repeatable) -- bypasses --top-n/"
+                                "--min-plddt entirely. Requires --assembly-id."
+    ),
+    num_seq_per_target: int = typer.Option(8, help="ProteinMPNN sequences per selected design."),
+    sampling_temp: float = typer.Option(0.1, help="ProteinMPNN sampling temperature."),
+    batch_size: int = typer.Option(8, help="Must evenly divide --num-seq-per-target."),
+    poll_interval: float = typer.Option(5.0, help="Seconds between status checks."),
+    timeout: int = typer.Option(
+        900, help="Give up waiting after this many seconds, per assembly. ProteinMPNN is always a "
+                   "local process -- unlike RFdiffusion's SLURM jobs, it does not survive this "
+                   "command exiting."
+    ),
+):
+    """Run ProteinMPNN against each assembly's best RFdiffusion design(s)."""
+    try:
+        df = pipeline.run_pmpnn(
+            assembly_id=assembly_id, top_n=top_n, min_plddt=min_plddt, select=select,
+            num_seq_per_target=num_seq_per_target, sampling_temp=sampling_temp,
+            batch_size=batch_size, poll_interval=poll_interval, timeout=timeout,
+            state_dir=ctx.obj["state_dir"],
+        )
+    except pipeline.StageNotFoundError as exc:
+        _fail(str(exc))
+    except (ValueError, RuntimeError) as exc:
+        _fail(f"ProteinMPNN run failed: {exc}")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"ProteinMPNN failed: {exc}")
+
+    console.print(f"[bold green]✓[/bold green] {len(df)} sequence row(s) written.")
+    _summarize(df, empty_hint="No assembly had a completed RFdiffusion job ready -- check `symbro status`.")
+    if not df.empty:
+        console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/pmpnn.pkl[/cyan] (preview: pmpnn.csv)")
+        console.print("  Structure-prediction screening commands are coming in the next round.")
+
+
+@app.command()
+def clean(
+    ctx: typer.Context,
+    keep_state: bool = typer.Option(
+        False, "--keep-state", help="Don't clear .symbro/ checkpoints -- only scratch files. See "
+                                     "the warning below before using this."
+    ),
+    keep_downloads: bool = typer.Option(False, "--keep-downloads", help="Don't clear temporary_files/."),
+    keep_subunits: bool = typer.Option(
+        False, "--keep-subunits", help="Don't clear temporary_subunits/ (isolated rings + RFdiffusion designs)."
+    ),
+    keep_simulations: bool = typer.Option(
+        False, "--keep-simulations", help="Don't clear temporary_simulations/ (ProteinMPNN output)."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be cleared without deleting anything."),
+):
+    """
+    Clear scratch files and checkpoints between pipeline runs -- the
+    "start fresh" button. Clears everything by default (every
+    .symbro/*.pkl checkpoint, plus temporary_files/, temporary_subunits/,
+    temporary_simulations/); use --keep-* to narrow it. Clearing scratch
+    files without also clearing the matching checkpoint(s) leaves stale
+    filepath references behind, which is why --keep-state exists but
+    isn't the default -- only reach for it if you specifically know why.
+    """
+    cleared = pipeline.clean(
+        state=not keep_state, downloads=not keep_downloads,
+        subunits=not keep_subunits, simulations=not keep_simulations,
+        dry_run=dry_run, state_dir=ctx.obj["state_dir"],
+    )
+
+    verb = "Would clear" if dry_run else "Cleared"
+    nothing = not cleared["state"] and not any(
+        cleared[k] for k in ("temporary_files", "temporary_subunits", "temporary_simulations")
+    )
+    if nothing:
+        console.print("[yellow]Nothing to clear.[/yellow]")
+        return
+
+    console.print(f"[bold green]✓[/bold green] {verb}:")
+    if cleared["state"]:
+        console.print(f"  checkpoints: {', '.join(cleared['state'])}")
+    for key, label in (
+        ("temporary_files", "temporary_files/"),
+        ("temporary_subunits", "temporary_subunits/"),
+        ("temporary_simulations", "temporary_simulations/"),
+    ):
+        if cleared[key]:
+            console.print(f"  {label}")
+
+    if dry_run:
+        console.print("  (dry run -- nothing was actually deleted; drop --dry-run to apply.)")
 
 
 if __name__ == "__main__":

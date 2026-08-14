@@ -23,6 +23,15 @@ from toolkit.paths import resolve_path, to_portable
 # {pdb_id} must be lowercase for this endpoint to resolve correctly.
 RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download/{pdb_id}-assembly{assembly_num}.cif.gz"
 
+# Bounded so a stalled/unresponsive connection to files.rcsb.org can't hang
+# `symbro download` (and therefore the whole CLI) forever with no feedback --
+# confirmed this was previously unbounded (plain requests.get(url), no
+# timeout=) and is the single network call in this module that wasn't
+# already handled some other way. 10s to connect (RCSB is normally
+# sub-second), 60s to read a response once connected (individual assembly
+# .cif.gz files are small -- generous margin for a slow link).
+DOWNLOAD_TIMEOUT = (10, 60)
+
 # Name of the workspace-visible scratch folder. Kept as a module-level
 # constant (rather than hardcoded inline) so if you ever want to rename it,
 # there's exactly one place to change.
@@ -156,7 +165,7 @@ def add_download_columns(df, id_column="entry_id", assembly_column="assembly_num
     return df
 
 
-def download_structure(filepath, url, overwrite=False):
+def download_structure(filepath, url, overwrite=False, timeout=DOWNLOAD_TIMEOUT):
     """
     Downloads one gzip-compressed assembly file from `url` and writes the
     decompressed .cif contents to `filepath`.
@@ -165,9 +174,20 @@ def download_structure(filepath, url, overwrite=False):
         download entirely — safe to re-run a download loop repeatedly
         without re-fetching everything each time.
 
+    timeout : passed straight to requests.get() — (connect_timeout,
+        read_timeout) seconds, see DOWNLOAD_TIMEOUT above. Without this,
+        a stalled connection to files.rcsb.org hangs forever with no
+        error and no feedback, which is exactly what was happening here
+        before this was added.
+
     `filepath` may be relative (as stored in downloaded.pkl -- see
     paths.py) or absolute (older checkpoints, or a caller-supplied path);
     resolved to absolute here, right before it's actually used, either way.
+
+    Raises requests.exceptions.RequestException (connection error, timeout,
+    or a non-2xx status via raise_for_status()) if the download doesn't
+    succeed -- see download_candidates() for how batch calls handle a
+    single failure without aborting the rest.
     """
     filepath = resolve_path(filepath)
 
@@ -176,7 +196,7 @@ def download_structure(filepath, url, overwrite=False):
 
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    response = requests.get(url)
+    response = requests.get(url, timeout=timeout)
 
     # raise_for_status() raises an exception if the server returned an error
     # (e.g. 404 for a withdrawn or renumbered entry) instead of silently
@@ -217,10 +237,22 @@ def download_candidates(candidates, data_dir=None, id_column="entry_id", assembl
       which is what actually tells them apart (see its docstring); this
       function only decides list-vs-DataFrame.
 
+    Prints one line per file as it starts downloading (previously silent
+    until the whole batch finished, which made a large batch — or a slow
+    connection — look identical to a hang; see DOWNLOAD_TIMEOUT above for
+    the other half of that fix). A single candidate's download failing
+    (404 for a withdrawn/renumbered entry, a timeout, any
+    requests.exceptions.RequestException) is reported by assembly_id and
+    skipped rather than aborting the rest of the batch — same fail-soft
+    convention isolate.py's from_rings() / run_pmpnn() already use — so
+    one bad ID doesn't cost you every other download that would have
+    otherwise succeeded.
+
     Returns a DataFrame with assembly_id (if built from a list, or however
     the input DataFrame named it), entry_id, assembly_num, filepath, and
     url columns, PLUS every other column the input DataFrame already had —
-    filepath is what you hand to gemmi or distance.py next.
+    filepath is what you hand to gemmi or distance.py next. Only rows that
+    actually downloaded successfully are included.
     """
     if data_dir is None:
         data_dir = get_temp_dir()
@@ -233,8 +265,20 @@ def download_candidates(candidates, data_dir=None, id_column="entry_id", assembl
     else:
         df = build_download_table(candidates, data_dir=data_dir)
 
-    for _, row in df.iterrows():
-        download_structure(row["filepath"], row["url"], overwrite=overwrite)
+    id_col = combined_id_column if combined_id_column in df.columns else None
+    failed_idx = []
+    total = len(df)
+    for i, (idx, row) in enumerate(df.iterrows(), start=1):
+        label = row[id_col] if id_col else row["filepath"]
+        print(f"[{i}/{total}] Downloading {label} ...")
+        try:
+            download_structure(row["filepath"], row["url"], overwrite=overwrite)
+        except requests.exceptions.RequestException as exc:
+            print(f"  Failed: {label} — {exc}")
+            failed_idx.append(idx)
+
+    if failed_idx:
+        df = df.drop(index=failed_idx).reset_index(drop=True)
 
     return df
 

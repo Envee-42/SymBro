@@ -825,6 +825,60 @@ def submit(job: RFdiffusionJob, backend: Optional[str] = None, config: Optional[
     )
 
 
+def _conda_env_lib_dir(python_executable: str) -> Optional[str]:
+    """
+    Best-effort guess at a conda/venv environment's own lib/ directory
+    from its python executable's path (<env_root>/bin/python ->
+    <env_root>/lib), so a LOCALLY-invoked subprocess can be given that
+    directory first on LD_LIBRARY_PATH.
+
+    Why this exists: a compiled extension inside the env (scipy, torch,
+    DGL, ...) can need a newer libstdc++ than whatever the CALLING
+    shell's own LD_LIBRARY_PATH already points at -- e.g. an HPC site
+    that auto-loads a system gcc module in every login shell, shadowing
+    the env's own newer one (confirmed as a real failure on this
+    project's own cluster: GLIBCXX_3.4.29 needed, only 3.4.28 available
+    via the auto-loaded module's lib64). The SLURM backend's own
+    setup_lines already has a fix for this (an explicit LD_LIBRARY_PATH
+    export, since `conda activate` sets $CONDA_PREFIX there) -- but
+    _submit_local() here never runs a shell at all, so `conda activate`
+    never runs either, and $CONDA_PREFIX is never set to begin with.
+    Deriving the lib dir straight from python_executable's own path
+    sidesteps needing either a shell or $CONDA_PREFIX.
+
+    Returns None (never "") if python_executable doesn't look like a
+    <env_root>/bin/python layout, or that env_root has no lib/ directory
+    -- this only ever ADDS a path when it's confident doing so is
+    correct, never guesses, so it's a safe no-op everywhere this
+    convention doesn't hold.
+    """
+    bin_dir = os.path.dirname(os.path.abspath(python_executable))
+    if os.path.basename(bin_dir) != "bin":
+        return None
+    lib_dir = os.path.join(os.path.dirname(bin_dir), "lib")
+    return lib_dir if os.path.isdir(lib_dir) else None
+
+
+def _local_subprocess_env(python_executable: str) -> Optional[dict]:
+    """
+    Environment dict for a LOCALLY-invoked python_executable subprocess
+    -- a copy of os.environ with that env's own lib/ directory (see
+    _conda_env_lib_dir()) prepended to LD_LIBRARY_PATH -- or None if
+    there's nothing to add, in which case the caller should pass this
+    straight through as subprocess.Popen/run's env=: None there means
+    "inherit the parent's environment unchanged" (subprocess's own
+    default), so a None result here is exactly a no-op, never a
+    behavior change.
+    """
+    lib_dir = _conda_env_lib_dir(python_executable)
+    if lib_dir is None:
+        return None
+    env = dict(os.environ)
+    existing = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else lib_dir
+    return env
+
+
 def _submit_local(
     job: RFdiffusionJob, script_path: str = "scripts/run_inference.py",
     python_executable: str = "python", cwd: Optional[str] = None,
@@ -839,9 +893,16 @@ def _submit_local(
     # until the child exits) so this returns immediately -- the child
     # inherits its own duplicated copy of the log file descriptor, so
     # closing our handle at the end of the `with` block doesn't affect it.
+    # env=_local_subprocess_env(...) fixes the same GLIBCXX-shadowing
+    # class of bug the SLURM backend's setup_lines fixes -- see that
+    # function's docstring for why this backend needs its own fix
+    # instead of reusing setup_lines.
     log_path = f"{job.output_prefix}.log"
     with open(log_path, "w") as log_file:
-        process = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd)
+        process = subprocess.Popen(
+            argv, stdout=log_file, stderr=subprocess.STDOUT, cwd=cwd,
+            env=_local_subprocess_env(python_executable),
+        )
 
     return RFdiffusionRun(job=job, process=process, command=argv, log_path=log_path)
 
