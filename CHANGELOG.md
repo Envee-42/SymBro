@@ -13,16 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   cross-checks each assembly's empirically detected rings against RCSB's
   own annotated symmetry (`rcsb_struct_symmetry.symbol`, now always
   fetched by `symbro query`) and drops any assembly where none of its
-  annotated cyclic orders (`C2`-`C5`) were actually confirmed by
-  detection -- a real, if uncommon, sign of a PDB annotation issue (wrong
-  assembly marked biological, a crystallographic packing mate mistaken
-  for the real ring, etc.) rather than a genuine candidate worth pursuing
-  compute on. A warning naming the assembly, what was expected, and what
-  was actually detected is always printed. Dihedral/Platonic/helical/
-  asymmetric annotations, and `symbro local` candidates (never looked up
-  against RCSB), are left unvalidated -- out of scope for what symbro's
-  own cyclic-ring detector can confirm or refute. Pass
-  `--no-validate-symmetry` to keep every detected ring regardless.
+  expected cyclic axes were actually confirmed by detection -- a real,
+  if uncommon, sign of a PDB annotation issue (wrong assembly marked
+  biological, a crystallographic packing mate mistaken for the real
+  ring, etc.) rather than a genuine candidate worth pursuing compute on.
+  Covers plain cyclic annotations (`C2`-`C5`) directly, and Platonic
+  annotations (`T`, `O`, `I`) via their own known constituent cyclic
+  axes (e.g. `T` -> C3 or C2) -- this project's own target assemblies
+  are Platonic by nature, so that decomposition is exactly what
+  `symbro isolate` already extracts, not a guess. A warning naming the
+  assembly, what was expected, and what was actually detected is always
+  printed. Dihedral/helical/asymmetric annotations, and `symbro local`
+  candidates (never looked up against RCSB), are left unvalidated.
+  Pass `--no-validate-symmetry` to keep every detected ring regardless.
 
 ## [1.0.0] - 2026-08-18
 

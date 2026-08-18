@@ -34,12 +34,13 @@ runner = CliRunner()
     ("C2, C3", [2, 3]),
     ("C6", []),          # outside ALLOWED_ORDERS (2-5) -- out of scope, not guessed at
     ("D2", []),          # dihedral -- out of scope
-    ("T", []),           # Platonic -- out of scope
-    ("O", []),
-    ("I", []),
+    ("T", [3, 2]),       # Platonic: tetrahedral -- 4 C3 axes + 3 C2 axes
+    ("O", [4, 3, 2]),    # Platonic: octahedral -- 3 C4 + 4 C3 + 6 C2
+    ("I", [5, 3, 2]),    # Platonic: icosahedral -- 6 C5 + 10 C3 + 15 C2
     ("H", []),           # helical -- out of scope
     ("C1", []),          # asymmetric -- out of scope
     ("C3, D2", [3]),     # mixed: keep the in-scope token, drop the out-of-scope one
+    ("T, C4", [3, 2, 4]),  # Platonic token combined with a plain cyclic token
     (None, []),
     (float("nan"), []),
     ("", []),
@@ -109,6 +110,28 @@ def test_drop_symmetry_mismatches_out_of_scope_annotation_is_untouched():
     kept, dropped = pipeline._drop_symmetry_mismatches(rings_df, downloaded_df, _rings.ALLOWED_ORDERS)
     assert len(kept) == 1
     assert dropped.empty
+
+
+def test_drop_symmetry_mismatches_platonic_annotation_confirmed_by_one_axis():
+    # RCSB annotates a tetrahedral (T) assembly -- symbro only ever
+    # confirmed the C2 sub-ring for this component, which is still one
+    # of T's own two constituent axis types (C3, C2), so it's kept.
+    rings_df = pd.DataFrame([_rings_row("A1", "C2")])
+    downloaded_df = pd.DataFrame([{"assembly_id": "A1", "symmetry": "T"}])
+    kept, dropped = pipeline._drop_symmetry_mismatches(rings_df, downloaded_df, _rings.ALLOWED_ORDERS)
+    assert len(kept) == 1
+    assert dropped.empty
+
+
+def test_drop_symmetry_mismatches_platonic_annotation_true_mismatch_is_dropped():
+    # Octahedral (O) expects C4/C3/C2 -- nothing detected matches any of
+    # those, so this really does look like a bad annotation.
+    rings_df = pd.DataFrame([_rings_row("A1", "C5")])
+    downloaded_df = pd.DataFrame([{"assembly_id": "A1", "symmetry": "O"}])
+    kept, dropped = pipeline._drop_symmetry_mismatches(rings_df, downloaded_df, _rings.ALLOWED_ORDERS)
+    assert kept.empty
+    assert len(dropped) == 1
+    assert dropped.iloc[0]["expected"] == "C2, C3, C4"
 
 
 def test_drop_symmetry_mismatches_missing_symmetry_column_is_a_no_op():

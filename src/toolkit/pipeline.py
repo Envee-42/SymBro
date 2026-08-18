@@ -278,31 +278,52 @@ def run_local(
 
 _CYCLIC_SYMBOL_RE = re.compile(r"^C(\d+)$")
 
+# Platonic point groups -> the cyclic rotation axes they're actually built
+# from (proper-rotation subgroup only, which is what a homomeric protein
+# cage's chains are ever related by): T (tetrahedral) has 4 C3 axes + 3 C2
+# axes; O (octahedral) has 3 C4 + 4 C3 + 6 C2; I (icosahedral) has 6 C5 +
+# 10 C3 + 15 C2. This project's own target assemblies ARE, by nature,
+# Platonic -- geometry/rings.py's whole job is isolating their cyclic
+# sub-rings for RFdiffusion (see isolate.py, and rings.py's own T:3,3
+# example) -- so unlike dihedral/helical/asymmetric annotations (below),
+# this decomposition isn't a guess, it's exactly what the rest of this
+# pipeline already assumes and acts on.
+_PLATONIC_EXPECTED_ORDERS = {"T": (3, 2), "O": (4, 3, 2), "I": (5, 3, 2)}
+
 
 def _expected_cyclic_orders(annotated_symmetry, allowed_orders: Sequence[int]) -> list:
     """
-    Parses an RCSB rcsb_struct_symmetry.symbol value (e.g. "C3", or
+    Parses an RCSB rcsb_struct_symmetry.symbol value (e.g. "C3", "T", or
     "C3, C2" -- query.extract_leaf_values' comma-join of a multi-component
     assembly's several symmetry records) into the cyclic orders symbro's
-    own ring detector could, in principle, confirm or refute.
+    own ring detector could, in principle, confirm or refute: a plain
+    "C{n}" token maps to itself, and "T"/"O"/"I" map to every cyclic axis
+    order their Platonic point group actually contains (see
+    _PLATONIC_EXPECTED_ORDERS) -- finding ANY one of them is enough for
+    _drop_symmetry_mismatches() to keep the assembly, same as a
+    multi-component "C3, C2" annotation already works.
 
-    Anything outside that scope -- dihedral "D*", Platonic "T"/"O"/"I",
-    helical "H", asymmetric "C1", an order outside allowed_orders (e.g.
-    "C6"), or a missing/NaN value -- is simply dropped from the result,
-    not guessed at: this project's own detector (geometry/rings.py) only
-    ever reasons about head-to-tail cyclic sub-rings, so asserting which
-    of those a Dn/T/O/I point group "should" decompose into would be
-    claiming structural-biology knowledge this project doesn't otherwise
-    have. Returns [] if nothing in the annotation is in scope.
+    Dihedral "D*", helical "H", asymmetric "C1", an order outside
+    allowed_orders (e.g. "C6"), or a missing/NaN value are still simply
+    dropped from the result, not guessed at -- this project doesn't
+    otherwise claim to know which cyclic sub-rings THOSE point groups
+    decompose into the way it does for its own Platonic target
+    assemblies. Returns [] if nothing in the annotation is in scope.
     """
     if annotated_symmetry is None or (isinstance(annotated_symmetry, float) and pd.isna(annotated_symmetry)):
         return []
     allowed = set(allowed_orders)
     orders = []
     for token in str(annotated_symmetry).split(","):
-        match = _CYCLIC_SYMBOL_RE.match(token.strip())
-        if match and int(match.group(1)) in allowed:
-            orders.append(int(match.group(1)))
+        token = token.strip()
+        match = _CYCLIC_SYMBOL_RE.match(token)
+        if match:
+            if int(match.group(1)) in allowed:
+                orders.append(int(match.group(1)))
+            continue
+        for order in _PLATONIC_EXPECTED_ORDERS.get(token, ()):
+            if order in allowed and order not in orders:
+                orders.append(order)
     return orders
 
 
@@ -322,16 +343,21 @@ def _drop_symmetry_mismatches(
     compute chasing.
 
     Only assemblies whose annotation includes at least one in-scope
-    cyclic order (see _expected_cyclic_orders) are checked at all --
-    dihedral/Platonic/other annotations, or a missing "symmetry" column
-    entirely (e.g. `symbro local` candidates, never looked up against
-    RCSB), are left untouched.
+    cyclic order (see _expected_cyclic_orders -- plain "C{n}" tokens, or
+    "T"/"O"/"I" mapped to their own known constituent axes) are checked
+    at all -- dihedral/helical/asymmetric annotations, or a missing
+    "symmetry" column entirely (e.g. `symbro local` candidates, never
+    looked up against RCSB), are left untouched.
 
     An assembly is dropped -- every one of its rows, across every
     detected symmetry_type/component -- only if NONE of its expected
     cyclic orders were found anywhere in rings_df for that assembly_id.
-    Finding even one (e.g. RCSB says "C3, C2" and only the C3 ring was
-    confirmed) is enough to keep it.
+    Finding even one (e.g. RCSB says "C3, C2", or "T" which expands to
+    (3, 2), and only the C3 ring was confirmed) is enough to keep it --
+    deliberately lenient, since even a genuinely correct Platonic
+    assembly's OTHER axis types can fail rings.py's own N-C-register
+    detection for real geometric reasons having nothing to do with
+    whether the annotation is right.
 
     Returns (kept_df, dropped_df). dropped_df has one row per dropped
     assembly_id: assembly_id, expected (e.g. "C3", or "C2, C3" if more
