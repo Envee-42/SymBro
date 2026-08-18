@@ -2,13 +2,19 @@
 orientation.py — relative termini orientation for symmetry-grouped chains.
 
 Takes rings.py's detect_symmetry_rings/from_structure output (one row per
-detected symmetry axis per assembly: assembly_id, symmetry_type,
-chain_groups, mean_distance, std_distance, junctions, axis_count,
-equivalent_groups) and, for ONE symmetry_type chosen by the caller (never
-all of them at once — a user analyzing a C3 axis usually isn't asking
-about the C2 axes the same assembly may also have), builds a new
-DataFrame narrowed to (assembly_id, symmetry_type, chain_groups,
-mean_distance) with a new orientation column appended.
+detected symmetry axis per DISTINCT COMPONENT per assembly: assembly_id,
+symmetry_type, component_id, chain_groups, mean_distance, std_distance,
+recommended_linker_length, junctions, axis_count, equivalent_groups) and,
+for ONE symmetry_type chosen by the caller (never all of them at once —
+a user analyzing a C3 axis usually isn't asking about the C2 axes the
+same assembly may also have), builds a new DataFrame narrowed to
+(assembly_id, symmetry_type, component_id, chain_groups, mean_distance,
+axis_count, recommended_linker_length) with a new orientation column
+appended. component_id/axis_count/recommended_linker_length are carried
+through (not just chain_groups/mean_distance) so a caller can still tell,
+after this module's own narrowing, which structurally distinct component
+a row belongs to and how many redundant copies of it were found — this
+module itself never READS those three columns, it only preserves them.
 
 Design, in short:
 
@@ -44,8 +50,10 @@ Design, in short:
   means the two termini point the same way, 180 means they point directly
   opposite.
 
-- One row per input (assembly_id, symmetry_type) pair is preserved (same
-  grain as rings.py's output): "mean_orientation" is the mean junction
+- One row per input (assembly_id, symmetry_type, component_id) triple is
+  preserved (same grain as rings.py's output — possibly more than one row
+  per (assembly_id, symmetry_type) for a multi-component assembly):
+  "mean_orientation" is the mean junction
   angle for that group, and "orientation_junctions" lists every individual
   (from_chain, to_chain, angle_degrees) triple that went into it — the
   same mean/detail pairing rings.py itself uses for
@@ -68,7 +76,15 @@ from toolkit.geometry.termini import get_chain_ca_geometry
 from toolkit.geometry.rings import ALLOWED_ORDERS
 
 
-_INPUT_COLUMNS: Tuple[str, ...] = ("assembly_id", "symmetry_type", "chain_groups", "mean_distance")
+# The four rings.py has always produced — required, missing any of these
+# is almost certainly a caller passing the wrong DataFrame entirely.
+_CORE_INPUT_COLUMNS: Tuple[str, ...] = ("assembly_id", "symmetry_type", "chain_groups", "mean_distance")
+# Added when rings.py started scoping exclusivity per identity component
+# (see rings.py's module docstring) — treated as OPTIONAL here so a
+# rings_df produced by an older rings.py (pre-component_id) still works;
+# filled with None if absent rather than raising.
+_OPTIONAL_INPUT_COLUMNS: Tuple[str, ...] = ("component_id", "axis_count", "recommended_linker_length")
+_INPUT_COLUMNS: Tuple[str, ...] = _CORE_INPUT_COLUMNS + _OPTIONAL_INPUT_COLUMNS
 _OUTPUT_COLUMNS: Tuple[str, ...] = _INPUT_COLUMNS + ("mean_orientation", "orientation_junctions")
 
 DEFAULT_VECTOR_WINDOW: int = 4
@@ -99,11 +115,16 @@ def _angle_degrees(v1: Optional[np.ndarray], v2: Optional[np.ndarray]) -> Option
 def select_symmetry_type(rings_df: pd.DataFrame, symmetry_type: str) -> pd.DataFrame:
     """
     Narrows rings.py's output to just the rows for ONE requested
-    symmetry_type (e.g. "C3"), and to just the four columns this module
-    cares about (assembly_id, symmetry_type, chain_groups, mean_distance)
-    — std_distance/junctions/axis_count/equivalent_groups all describe the
-    DISTANCE-based grouping decision rings.py already made and aren't
-    needed again here.
+    symmetry_type (e.g. "C3"), and to just the columns this module cares
+    about or passes through: assembly_id, symmetry_type, chain_groups,
+    mean_distance (required — std_distance/junctions/equivalent_groups
+    describe the DISTANCE-based grouping decision rings.py already made
+    and aren't needed again here), plus component_id/axis_count/
+    recommended_linker_length (optional pass-through — present on any
+    rings_df from the current rings.py, filled with None if the caller
+    supplies an older rings_df that predates them, e.g. a checkpoint
+    written before this project started scoping exclusivity per identity
+    component).
 
     Raises ValueError for an unrecognized symmetry_type (same C2..C5
     vocabulary rings.py itself enforces via ALLOWED_ORDERS) rather than
@@ -115,11 +136,18 @@ def select_symmetry_type(rings_df: pd.DataFrame, symmetry_type: str) -> pd.DataF
     if symmetry_type not in allowed:
         raise ValueError(f"symmetry_type must be one of {sorted(allowed)} — got {symmetry_type!r}")
 
-    missing = [c for c in _INPUT_COLUMNS if c not in rings_df.columns]
+    missing = [c for c in _CORE_INPUT_COLUMNS if c not in rings_df.columns]
     if missing:
         raise ValueError(f"rings_df is missing expected column(s): {missing}")
 
-    subset = rings_df.loc[rings_df["symmetry_type"] == symmetry_type, list(_INPUT_COLUMNS)]
+    working = rings_df
+    missing_optional = [c for c in _OPTIONAL_INPUT_COLUMNS if c not in working.columns]
+    if missing_optional:
+        working = working.copy()
+        for col in missing_optional:
+            working[col] = None
+
+    subset = working.loc[working["symmetry_type"] == symmetry_type, list(_INPUT_COLUMNS)]
     return subset.reset_index(drop=True)
 
 
@@ -217,6 +245,7 @@ def compute_assembly_orientations(
         return _empty_result(subset)
 
     structure = gemmi.read_structure(filepath)
+    structure.setup_entities()  # required for get_polymer() on a header-less, ATOM-only file
     model = structure[0]
 
     chain_geometry: Dict[str, dict] = {}
@@ -330,6 +359,7 @@ def plot_chain_group_vectors(filepath, chain_group, vector_window=4, vector_leng
     project, so the whole thing is one paste-able, dependency-free block.
     """
     structure = gemmi.read_structure(filepath)
+    structure.setup_entities()  # required for get_polymer() on a header-less, ATOM-only file
     model = structure[0]
 
     chain_by_name = {chain.name: chain for chain in model}

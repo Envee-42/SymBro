@@ -90,7 +90,7 @@ def test_run_rfdiffusion_block_and_poll_completes(project_dir, ring_pdb, monkeyp
     install_rfdiffusion_fakes(monkeypatch, calls)
     df = pipeline.run_rfdiffusion(rings_df(["TEST-1"], ring_pdb), num_designs=2, diffuser_T=10)
 
-    assert list(df.columns) == ["assembly_id", "symmetry_type", "chain_groups", "run", "state", "design_paths"]
+    assert list(df.columns) == ["assembly_id", "symmetry_type", "component_id", "chain_groups", "run", "state", "design_paths"]
     assert len(df) == 1
     assert df.iloc[0]["state"] == "completed"
     assert len(df.iloc[0]["design_paths"]) == 2

@@ -323,6 +323,7 @@ def compute_structure_termini_ss(
     all-None row). Empty (but correctly-columned) if no chain qualifies.
     """
     structure = gemmi.read_structure(filepath)
+    structure.setup_entities()  # required for get_polymer() on a header-less, ATOM-only file
     model = structure[0]
 
     rows = []
@@ -468,6 +469,7 @@ def compute_assembly_termini_ss(
         return _empty_ring_result(subset)
 
     structure = gemmi.read_structure(filepath)
+    structure.setup_entities()  # required for get_polymer() on a header-less, ATOM-only file
     model = structure[0]
 
     chain_geometry: Dict[str, dict] = {}

@@ -4,109 +4,114 @@ structure_prediction.py) against an ALREADY-COMPLETED ProteinMPNN run's
 output, without re-running query/download/geometry/RFdiffusion/
 ProteinMPNN from scratch.
 
-pipeline.py is a straight-through script with no checkpointing, so
-re-running it top to bottom just to add this one downstream step would
-redo everything expensive (structure queries, RFdiffusion, ProteinMPNN)
-for no reason. Everything this script needs is already sitting on disk
-from that earlier run:
+Run this FROM the project root (same convention every `symbro` command
+already requires — .symbro/ and temporary_simulations/ are both resolved
+relative to cwd) — no need to touch pipeline.py or re-run any of its
+earlier stages.
 
-  sequences_df : reloaded straight from "{mpnn out_folder}/sequences.csv"
-      — written by pipeline.py's own last few lines, nothing to
-      recompute.
+  sequences_df : reloaded via pipeline.load_checkpoint("pmpnn") --
+      .symbro/pmpnn.pkl, written by pipeline.mpnn() / `symbro pmpnn`'s
+      own last line. (An earlier version of this script instead looked
+      for a "sequences.csv" inside the ProteinMPNN out_folder -- that
+      file is never actually written by pipeline.py/pmpnn.py; fixed here
+      to reload from the real checkpoint every other stage already
+      uses.) Narrow to one assembly with ASSEMBLY_ID below if the
+      checkpoint has rows from more than one run.
+
   design_paths : the RFdiffusion design PDBs ProteinMPNN actually read
-      as input. Two ways this script can find them, tried in order:
-        1. A "design_path" column right in sequences.csv, if this run's
-           pipeline.py already included the small addition that writes
-           one (source_pdb -> the real path, via mpnn_job.input_pdbs) —
-           the robust, permanent fix, and what any FUTURE run will have.
-        2. Falling back to "{mpnn out_folder}/_mpnn_inputs/pdbs/*.pdb" —
-           pmpnn.py's own _stage_input_pdbs() copies ProteinMPNN's exact
-           input PDBs there before every run and only clears that folder
-           at the START of a fresh submit() against the SAME out_folder
-           (never after a run completes) — so for a sequences.csv
-           written BEFORE the design_path column existed, these staged
-           copies are still the correct, exact files, just not linked
-           to sequences.csv explicitly yet. This fallback breaks only if
-           you've since resubmitted a DIFFERENT ProteinMPNN job reusing
-           the same out_folder, which overwrites pdbs/ with that newer
-           job's inputs — pipeline.py's design_path column exists
-           specifically so this stops being a concern going forward.
-
-Just edit the settings below and run — no need to touch pipeline.py or
-re-run any of its earlier stages.
+      as input, recovered from "{mpnn out_folder}/_mpnn_inputs/pdbs/*.pdb"
+      -- pmpnn.py's own _stage_input_pdbs() copies ProteinMPNN's exact
+      input PDBs there before every run, and only clears/overwrites that
+      folder at the START of the NEXT submit() against the SAME
+      out_folder (never after a run completes). pipeline.py never passes
+      a per-assembly out_folder today, so if you've run `symbro pmpnn`
+      against MORE THAN ONE assembly since the last `symbro clean`, only
+      the LAST one's designs are still staged here -- either narrow
+      ASSEMBLY_ID to that one, or re-run `symbro pmpnn --assembly-id ...`
+      for whichever assembly you actually want to screen right before
+      running this script.
 """
 
 import glob
 import os
 
-import pandas as pd
+from toolkit import config, pipeline, pmpnn, structure_prediction
 
-from toolkit import config, pmpnn, structure_prediction
+# Wherever `symbro pmpnn` printed its designs as being written --
+# normally temporary_simulations/mpnn_designs, pmpnn.py's own default
+# out_folder (see prepare_mpnn_job()'s out_folder=None fallback).
+MPNN_OUT_FOLDER = os.path.join("temporary_simulations", "mpnn_designs")
 
-# Wherever pipeline.py's own "mpnn_run.job.out_folder" pointed — it's
-# the folder pipeline.py printed when it wrote "Wrote N sequences to
-# .../sequences.csv"; normally temporary_simulations/mpnn_designs/.
-MPNN_OUT_FOLDER = r"C:\path\to\your\symbro\project\temporary_simulations\mpnn_designs"
+# Narrow the reloaded .symbro/pmpnn.pkl checkpoint to one assembly (and,
+# for a multi-component assembly, one component) -- leave both None to
+# use every row in the checkpoint (only safe if it's a single assembly/
+# component run -- see this module's own docstring above on staged-PDB
+# reuse).
+ASSEMBLY_ID = None      # e.g. "4V6B-5"
+COMPONENT_ID = None
 
-# Which predictor to screen with — "alphafold2", "boltz", or "af3" (see
+# Which predictor to screen with -- "alphafold2", "boltz", or "af3" (see
 # structure_prediction.py's own module docstring for the licensing/setup
 # tradeoffs). Leave as None to use installation.yaml's own
 # structure_prediction.default instead of naming one here.
 PREDICTOR = "boltz"
 
-TOP_N = 3          # pmpnn.select_best_designs()'s top_n — the cheap pre-filter
-MAX_RMSD = 2.0      # select_validated_designs()'s max_rmsd (Angstrom)
-MIN_PLDDT = 70.0    # select_validated_designs()'s min_plddt
+TOP_N = 3            # pmpnn.select_best_designs()'s top_n -- the cheap pre-filter
+MAX_RMSD = 2.0       # select_validated_designs()'s max_rmsd (Angstrom)
+MIN_PLDDT = 70.0     # select_validated_designs()'s min_plddt
+
+# AF3 only -- ignored for every other PREDICTOR value. See af3.py's own
+# module docstring, and installation.yaml's af3: section, before setting
+# these.
+AF3_MODEL_DIR = None
+AF3_DB_DIR = None
+AF3_TERMS_ACKNOWLEDGED = False
 
 
-def _load_design_paths(sequences_df: pd.DataFrame, mpnn_out_folder: str) -> list:
-    if "design_path" in sequences_df.columns:
-        paths = sorted(sequences_df["design_path"].dropna().unique().tolist())
-        missing = [p for p in paths if not os.path.exists(p)]
-        if missing:
-            raise FileNotFoundError(
-                f"sequences.csv's own design_path column names {len(missing)} file(s) that "
-                f"no longer exist on disk (e.g. {missing[0]!r}) — the run these designs came "
-                f"from may have been cleaned up. Falling back isn't safe here since the "
-                f"column exists but is stale; re-run pipeline.py's RFdiffusion/ProteinMPNN "
-                f"stages if these files were genuinely deleted."
-            )
-        print(f"Found {len(paths)} reference design PDB(s) via sequences.csv's own design_path column.")
-        return paths
-
+def _load_design_paths(mpnn_out_folder: str) -> list:
     staged_dir = os.path.join(mpnn_out_folder, "_mpnn_inputs", "pdbs")
     paths = sorted(glob.glob(os.path.join(staged_dir, "*.pdb")))
     if not paths:
         raise FileNotFoundError(
-            f"sequences.csv has no design_path column, and no staged input PDBs were found "
-            f"under {staged_dir!r} either (pmpnn.py's own _stage_input_pdbs() writes this "
-            f"folder every time ProteinMPNN actually runs) — MPNN_OUT_FOLDER is probably "
-            f"pointed at the wrong run, or that folder's been cleaned up since."
+            f"No staged input PDBs found under {staged_dir!r} (pmpnn.py's own "
+            f"_stage_input_pdbs() writes this folder every time ProteinMPNN actually "
+            f"runs) -- MPNN_OUT_FOLDER is probably pointed at the wrong run, or that "
+            f"folder's been cleaned (`symbro clean`) since."
         )
-    print(
-        f"sequences.csv predates the design_path column — recovered {len(paths)} reference "
-        f"design PDB(s) from {staged_dir!r} instead (pmpnn.py's staged ProteinMPNN inputs)."
-    )
+    print(f"Found {len(paths)} reference design PDB(s) under {staged_dir!r}.")
     return paths
 
 
 def main():
-    csv_path = os.path.join(MPNN_OUT_FOLDER, "sequences.csv")
-    sequences_df = pd.read_csv(csv_path)
-    print(f"Reloaded {len(sequences_df)} sequences from {csv_path}")
+    sequences_df = pipeline.load_checkpoint(pipeline.PMPNN_STAGE)
+    print(f"Reloaded {len(sequences_df)} sequence row(s) from .symbro/{pipeline.PMPNN_STAGE}.pkl")
 
-    design_paths = _load_design_paths(sequences_df, MPNN_OUT_FOLDER)
+    if ASSEMBLY_ID is not None:
+        sequences_df = sequences_df[sequences_df["assembly_id"] == ASSEMBLY_ID]
+    if COMPONENT_ID is not None:
+        sequences_df = sequences_df[sequences_df["component_id"] == COMPONENT_ID]
+    if sequences_df.empty:
+        raise ValueError(
+            f"No rows left after filtering to assembly_id={ASSEMBLY_ID!r}, "
+            f"component_id={COMPONENT_ID!r} -- check .symbro/pmpnn.csv for what's actually there."
+        )
+
+    design_paths = _load_design_paths(MPNN_OUT_FOLDER)
 
     shortlist = pmpnn.select_best_designs(sequences_df, top_n=TOP_N)
     print(f"\nShortlist ({len(shortlist)} candidate(s), top {TOP_N} per design by ProteinMPNN's own score):")
     print(shortlist[["source_pdb", "sequence", "global_score", "rank"]])
 
     cfg = config.load_installation_config()
-    winners = structure_prediction.run(
-        PREDICTOR, shortlist, design_paths, config=cfg,
-        max_rmsd=MAX_RMSD, min_plddt=MIN_PLDDT,
-    )
-    print(f"\n{len(winners)} candidate(s) passed self-consistency screening (max_rmsd={MAX_RMSD}, min_plddt={MIN_PLDDT}):")
+    run_kwargs = dict(max_rmsd=MAX_RMSD, min_plddt=MIN_PLDDT)
+    if PREDICTOR in ("af3", "alphafold3"):
+        run_kwargs.update(
+            model_dir=AF3_MODEL_DIR, db_dir=AF3_DB_DIR, terms_acknowledged=AF3_TERMS_ACKNOWLEDGED,
+        )
+
+    winners = structure_prediction.run(PREDICTOR, shortlist, design_paths, config=cfg, **run_kwargs)
+    print(f"\n{len(winners)} candidate(s) passed self-consistency screening "
+          f"(max_rmsd={MAX_RMSD}, min_plddt={MIN_PLDDT}):")
     print(winners)
 
     out_path = os.path.join(MPNN_OUT_FOLDER, f"validated_designs_{PREDICTOR or 'default'}.csv")

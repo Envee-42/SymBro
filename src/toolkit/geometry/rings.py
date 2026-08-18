@@ -43,12 +43,39 @@ repeated subunits rather than fitting a global rotation matrix):
   discarding anything that reuses an already-claimed chain). ACROSS
   orders there's no such restriction — a chain sitting on a C2 axis and a
   C3 axis simultaneously is exactly how a T/O/I cage is built.
-- Output has one row per detected axis order per assembly (never one row
-  per individual grouping): the tightest grouping is "chain_groups", every
-  other accepted grouping of that same order is folded into
-  "equivalent_groups" on the same row.
+- Output has one row per detected axis order PER STRUCTURALLY DISTINCT
+  COMPONENT per assembly — never one row per individual grouping, but
+  also never one row that silently pools multiple different proteins
+  together. "Component" here means one of group_chains_by_identity's
+  sequence-identity clusters: exclusivity resolution (which candidate
+  becomes "chain_groups" vs. gets folded into "equivalent_groups") is
+  now scoped to ONE identity cluster at a time, so a two-component cage
+  (e.g. a T:3,3 architecture, two different C3-symmetric proteins) gets
+  TWO rows for symmetry_type="C3" — one per protein — each carrying its
+  own "component_id" (the identity cluster's index), its own tightest
+  "chain_groups", and its own "equivalent_groups" containing ONLY that
+  same component's redundant repeats (never another component's rings).
+  This matters because every downstream stage that consumes this
+  DataFrame (isolate.py, and via it rfdiffusion.py/pmpnn.py) iterates
+  every row rather than assuming one row per (assembly_id,
+  symmetry_type) — so a multi-component assembly is now carried all the
+  way through the pipeline automatically, rather than only its
+  geometrically "tightest" component surviving past detection. This is a
+  behavior-preserving refactor at the level of WHICH groupings are
+  accepted (candidates from different identity clusters never share
+  chains, so scoping exclusivity resolution per cluster instead of
+  pooling everything first accepts exactly the same set of groupings —
+  only how they're bucketed into rows changes).
+- Each row also carries "recommended_linker_length" — an (min_residues,
+  max_residues) estimate, derived directly from that grouping's own
+  measured mean_distance via estimate_linker_length() below, for how
+  long a diffused linker spanning that junction should be. This feeds
+  straight into RFdiffusion's contig "diffuse" segment length
+  (rfdiffusion.py's build_linker_fusion_contig) so the diffusion length
+  range is set from this ring's own geometry rather than a fixed guess.
 """
 
+import math
 from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -72,9 +99,15 @@ DEFAULT_CONTACT_CUTOFF: Optional[float] = 8.0
 # assemblies) — never the actual validity test, which is step homogeneity.
 DEFAULT_MAX_CANDIDATE_DISTANCE: Optional[float] = 100.0
 
+# estimate_linker_length()'s defaults — see that function's docstring for
+# the reasoning behind each value.
+DEFAULT_LINKER_MAX_REACH: float = 3.8   # Å/residue, fully-extended backbone upper bound
+DEFAULT_LINKER_MIN_REACH: float = 2.0   # Å/residue, conservative reach for a relaxed/coiled linker
+DEFAULT_LINKER_BUFFER: int = 2          # extra residues added at both ends for design/attachment slack
+
 _OUTPUT_COLUMNS: Tuple[str, ...] = (
-    "assembly_id", "symmetry_type", "chain_groups",
-    "mean_distance", "std_distance", "junctions",
+    "assembly_id", "symmetry_type", "component_id", "chain_groups",
+    "mean_distance", "std_distance", "recommended_linker_length", "junctions",
     "axis_count", "equivalent_groups",
 )
 
@@ -143,6 +176,56 @@ def _passes_tolerance(std: float, cv: float, tolerance: Optional[float], relativ
     (small mean, small std) are each judged on the yardstick that fits its
     own scale rather than one shared absolute cutoff."""
     return (tolerance is not None and std <= tolerance) or (relative_tolerance is not None and cv <= relative_tolerance)
+
+
+def estimate_linker_length(
+    distance: float,
+    max_reach: float = DEFAULT_LINKER_MAX_REACH,
+    min_reach: float = DEFAULT_LINKER_MIN_REACH,
+    buffer: int = DEFAULT_LINKER_BUFFER,
+) -> Tuple[int, int]:
+    """
+    Recommended (min_residues, max_residues) for a diffused linker meant
+    to span a measured junction distance (Angstrom) — feeds directly into
+    RFdiffusion's contig "diffuse" segment length (see rfdiffusion.py's
+    build_linker_fusion_contig / build_contig_string), so a ring's own
+    measured geometry sets the diffusion length range instead of a fixed
+    guess.
+
+    min_residues = ceil(distance / max_reach) + buffer: the fewest
+        residues that could possibly span `distance` even held fully
+        extended. max_reach defaults to 3.8 Å/residue, the standard
+        fully-extended (trans) backbone Cα-Cα spacing upper bound — fewer
+        residues than this literally cannot reach across the gap.
+    max_residues = ceil(distance / min_reach) + buffer: an upper bound
+        assuming a more relaxed, non-extended (coiled/flexible) linker
+        conformation. min_reach defaults to 2.0 Å/residue, a conservative
+        net per-residue reach for a loop that isn't held taut — this
+        gives RFdiffusion room to sample a natural-looking backbone
+        rather than being forced maximally stretched.
+    buffer defaults to +2 residues at both ends, for ordinary design/
+    attachment slack — the same kind of small, literature-adjacent-but-
+    tunable default this project already uses elsewhere (see
+    selfconsistency.py's max_rmsd=2.0/min_plddt=70.0 for the analogous
+    pattern: a reasonable starting point, not an absolute).
+
+    This is a triage HEURISTIC for picking a plausible diffusion length
+    range, not a guarantee RFdiffusion will actually close the gap at
+    either bound — always sanity-check resulting designs (e.g. against
+    selfconsistency.py's own thresholds) rather than treating this
+    interval as authoritative.
+
+    Returns (min_residues, max_residues), both >= 1 + buffer. Raises
+    ValueError for a non-positive distance/max_reach/min_reach.
+    """
+    if distance <= 0:
+        raise ValueError(f"distance must be positive — got {distance}")
+    if max_reach <= 0 or min_reach <= 0:
+        raise ValueError("max_reach and min_reach must both be positive")
+
+    min_residues = max(1, math.ceil(distance / max_reach)) + buffer
+    max_residues = max(min_residues, math.ceil(distance / min_reach) + buffer)
+    return min_residues, max_residues
 
 
 def _canonical_cycle(cycle: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -343,20 +426,41 @@ def detect_symmetry_rings(
     """
     Full single-assembly pipeline: load the structure, compute per-chain
     terminal geometry (termini.get_chain_ca_geometry), cluster chains by
-    sequence identity, then per symmetry order — pooling candidates across
-    every identity group, since group_chains_by_identity already
-    partitions all chains, so groups can never contend for the same chain
-    within one order — resolve disjoint exclusivity and keep the tightest
-    grouping plus any other accepted ones for that order.
+    sequence identity, then per symmetry order AND per identity cluster —
+    resolving disjoint exclusivity separately within each cluster, never
+    pooling different clusters together — keep the tightest grouping plus
+    any other accepted ones for that (order, cluster) pair.
 
-    Returns a DataFrame with one row per detected order:
-      assembly_id, symmetry_type ("C2".."C5"), chain_groups (tightest
-      grouping's chain-ID tuple), mean_distance / std_distance (that
-      grouping's termini step distances, Angstroms), junctions (list of
-      (from_chain, to_chain, distance) for that grouping), axis_count (how
-      many disjoint groupings of this order were found in total), and
-      equivalent_groups (every other accepted grouping's chain-ID tuple —
-      empty if chain_groups was the only one found).
+    Scoping exclusivity per identity cluster instead of globally doesn't
+    change WHICH groupings get accepted (candidates from different
+    clusters never share a chain, by construction of
+    group_chains_by_identity, so they could never have contended for the
+    same chain in a pooled resolution either) — it only changes how
+    accepted groupings are bucketed into output rows. The practical
+    effect: a multi-component assembly (e.g. a two-protein T:3,3 cage)
+    gets one row per component per order, each with its own
+    "component_id", rather than only its single geometrically tightest
+    component surviving into "chain_groups" while every OTHER component's
+    rings get silently folded into "equivalent_groups" alongside genuine
+    same-component duplicates (and then dropped — isolate.py's
+    isolate_assembly_rings/from_rings iterate every row of this
+    DataFrame but never read equivalent_groups).
+
+    Returns a DataFrame with one row per (detected order, identity
+    cluster) pair:
+      assembly_id, symmetry_type ("C2".."C5"), component_id (the
+      identity cluster's index — stable within one call for one
+      structure, not meaningful across different assemblies/calls),
+      chain_groups (tightest grouping's chain-ID tuple, for this
+      component), mean_distance / std_distance (that grouping's termini
+      step distances, Angstroms), recommended_linker_length
+      ((min_residues, max_residues), from estimate_linker_length() on
+      mean_distance), junctions (list of (from_chain, to_chain,
+      distance) for that grouping), axis_count (how many disjoint
+      groupings of this order were found for THIS component), and
+      equivalent_groups (every other accepted grouping's chain-ID tuple
+      for this SAME component — empty if chain_groups was the only one
+      found for it; never another component's rings).
 
     Empty (but correctly-columned) if nothing survives detection for any
     requested order.
@@ -366,6 +470,7 @@ def detect_symmetry_rings(
         raise ValueError(f"orders must be a subset of {ALLOWED_ORDERS} — got invalid {invalid}")
 
     structure = gemmi.read_structure(filepath)
+    structure.setup_entities()  # required for get_polymer() on a header-less, ATOM-only file
     model = structure[0]
 
     chain_geometry: Dict[str, dict] = {}
@@ -379,32 +484,33 @@ def detect_symmetry_rings(
 
     rows = []
     for order in sorted(set(orders)):
-        candidates: List[Dict[str, Any]] = []
-        for group in identity_groups:
+        for component_id, group in enumerate(identity_groups):
             usable = [name for name in group if name in chain_geometry]
             if len(usable) < order:
                 continue
             finder = find_c2_groupings if order == 2 else find_cyclic_groupings
             args = (usable, chain_geometry) if order == 2 else (usable, chain_geometry, order)
-            candidates.extend(finder(*args, tolerance=tolerance, relative_tolerance=relative_tolerance,
-                                      contact_cutoff=contact_cutoff, max_candidate_distance=max_candidate_distance,
-                                      contact_cache=contact_cache))
+            candidates = finder(*args, tolerance=tolerance, relative_tolerance=relative_tolerance,
+                                 contact_cutoff=contact_cutoff, max_candidate_distance=max_candidate_distance,
+                                 contact_cache=contact_cache)
 
-        accepted = select_disjoint_groupings(candidates)
-        if not accepted:
-            continue
+            accepted = select_disjoint_groupings(candidates)
+            if not accepted:
+                continue
 
-        main = accepted[0]
-        rows.append({
-            "assembly_id": assembly_id,
-            "symmetry_type": f"C{order}",
-            "chain_groups": main["chains"],
-            "mean_distance": main["mean_distance"],
-            "std_distance": main["std_distance"],
-            "junctions": main["junctions"],
-            "axis_count": len(accepted),
-            "equivalent_groups": [c["chains"] for c in accepted[1:]],
-        })
+            main = accepted[0]
+            rows.append({
+                "assembly_id": assembly_id,
+                "symmetry_type": f"C{order}",
+                "component_id": component_id,
+                "chain_groups": main["chains"],
+                "mean_distance": main["mean_distance"],
+                "std_distance": main["std_distance"],
+                "recommended_linker_length": estimate_linker_length(main["mean_distance"]),
+                "junctions": main["junctions"],
+                "axis_count": len(accepted),
+                "equivalent_groups": [c["chains"] for c in accepted[1:]],
+            })
 
     return pd.DataFrame(rows, columns=list(_OUTPUT_COLUMNS))
 

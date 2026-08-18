@@ -21,23 +21,27 @@ dependencies = [
     "rcsb-api>=1.7",
     "typer>=0.12",
     "rich>=13.0",
+    "torch>=2.0",
 ]
 
-# RFdiffusion/ProteinMPNN/the structure-prediction backends themselves stay
-# OUT of the base dependencies on purpose -- see rfdiffusion.py's own module
-# docstring: their installs are heavy, and most of this package's own users
-# (anyone just running the query/download/geometry/isolate stages) never
-# touch them at all. proteinmpnn IS listed here, unlike the others, because
-# unlike RFdiffusion's CUDA-pinned/DGL/SE(3)-Transformer stack, ProteinMPNN
-# only needs plain torch (confirmed against dauparas/ProteinMPNN's own
-# source: device selection falls back to CPU automatically, no CUDA/GPU
-# required) -- light enough to offer as a real, installable extra rather
-# than a manual per-machine env someone has to assemble by hand. Install
-# with `pip install -e ".[proteinmpnn]"`; RFdiffusion and the structure-
-# prediction backends still need their own separately-managed environment,
-# pointed at via installation.yaml, same as before.
-[project.optional-dependencies]
-proteinmpnn = ["torch>=2.0"]
+# torch is a base dependency (not an optional extra) because most symbro
+# users run ProteinMPNN -- see pmpnn.py's own module docstring: it only
+# needs plain torch (confirmed against dauparas/ProteinMPNN's own source:
+# device selection falls back to CPU automatically, no CUDA/GPU required),
+# not RFdiffusion's CUDA-pinned/DGL/SE(3)-Transformer stack, so bundling it
+# doesn't drag in anything heavy. `pip install -e .` here does NOT install
+# ProteinMPNN itself (the actual protein_mpnn_run.py script + model
+# weights) -- that's still your own separately-managed clone, pointed at
+# via installation.yaml's proteinmpnn.repo_path, same as before. This only
+# covers the python library ProteinMPNN needs to run.
+#
+# On a machine without a GPU, or where you don't want a CUDA build, prefer
+# the CPU-only wheel explicitly to avoid pip resolving a multi-GB CUDA
+# build by default: `pip install -e . --extra-index-url
+# https://download.pytorch.org/whl/cpu` -- see README.md's Installation
+# section. RFdiffusion and the structure-prediction backends still stay
+# fully external, config-only via installation.yaml -- their installs are
+# genuinely heavy/CUDA-pinned in a way plain torch is not.
 
 [project.scripts]
 symbro = "toolkit.cli:app"

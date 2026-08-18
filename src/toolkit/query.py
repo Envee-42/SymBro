@@ -173,8 +173,19 @@ FETCH_ONLY_ATTRIBUTES = set(DATA_ATTRIBUTES) - set(SEARCH_ATTRIBUTES)
 # Fields for which a range ("from X to Y") search generally makes more sense
 # than an exact match. Informational only (e.g. for a future NiceGUI form
 # deciding whether to render a range slider or a text box) — not enforced.
+#
+# "interface_area"/"interface_count" deliberately do NOT appear here: RCSB's
+# interface-level data isn't reachable through this module's assembly-level
+# fetch_metadata() at all -- interfaces are a separate Data API entity type
+# with their own composite ID (e.g. "4HHB-1.1", not the "4HHB-1" assembly
+# IDs used throughout this file), and a single assembly can have several
+# interfaces, so there's no settled single-scalar meaning for either name
+# yet (sum of all interface areas? largest? a count above some threshold?).
+# Add them back once that's built out as a real, separately-fetched,
+# explicitly-aggregated feature -- not before, so this set stays a trustworthy
+# list of attributes that actually work today.
 RANGE_HINTED_ATTRIBUTES = {
-    "weight", "interface_area", "resolution", "interface_count",
+    "weight", "resolution",
     "oligomeric_count", "polymer_entity_count", "model_quality", "date",
 }
 
@@ -231,6 +242,10 @@ def build_query(attribute, value, operator="exact_match"):
     path = SEARCH_ATTRIBUTES.get(attribute, attribute)
 
     if operator == "range":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(
+                f"operator='range' needs value=(low, high) — a 2-item list/tuple — got {value!r}."
+            )
         low, high = value
         q_low = AttributeQuery(attribute=path, operator="greater_or_equal", value=low)
         q_high = AttributeQuery(attribute=path, operator="less_or_equal", value=high)
@@ -521,13 +536,22 @@ def _cell_matches(cell, value, operator):
         return False
 
     if operator == "range":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(
+                f"operator='range' needs value=(low, high) — a 2-item list/tuple — got {value!r}."
+            )
         low, high = value
         if isinstance(cell, list):
             return any(low <= v <= high for v in cell)
         return low <= cell <= high
 
     if operator == "contains_phrase":
-        text = ", ".join(cell) if isinstance(cell, list) else str(cell)
+        # cell can be a list of NON-string leaves too (extract_leaf_values
+        # only comma-joins into a string when every leaf IS a string --
+        # e.g. several distinct numeric weights stay a plain [1024.5,
+        # 2048.0] list) -- str() each item before joining, or ", ".join()
+        # raises "sequence item 0: expected str instance, float found".
+        text = ", ".join(str(v) for v in cell) if isinstance(cell, list) else str(cell)
         return str(value).lower() in text.lower()
 
     if operator in ("greater", "greater_or_equal", "less", "less_or_equal"):

@@ -13,29 +13,50 @@ Design, in short:
   structure.from_rings) interchangeably — they all share the three
   columns this module actually needs: assembly_id, symmetry_type,
   chain_groups. rings.py's raw output additionally carries
-  "equivalent_groups" (every OTHER accepted grouping of the same
-  symmetry order) — deliberately never read here. "the main ring
-  grouping" always means chain_groups, the single tightest,
-  disjoint-resolved grouping rings.py already selected as the
-  representative one for that axis; its equivalent copies are, by
-  construction, physically redundant repeats of the identical junction
-  geometry, so isolating every one of them would just be duplicate work
-  for RFdiffusion/ProteinMPNN/folding to redo on what is structurally the
+  "equivalent_groups" (every OTHER accepted grouping of the SAME
+  identity component's axis — see rings.py's module docstring) —
+  deliberately never read here. "the main ring grouping" always means
+  chain_groups, the single tightest, disjoint-resolved grouping rings.py
+  already selected as the representative one for that (order, component)
+  pair; its equivalent copies are, by construction, physically redundant
+  repeats of the identical junction geometry FOR THAT SAME COMPONENT, so
+  isolating every one of them would just be duplicate work for
+  RFdiffusion/ProteinMPNN/folding to redo on what is structurally the
   same ring.
 
-- Output format defaults to mmCIF, not legacy PDB, because RCSB assembly
-  files commonly carry chain names longer than the legacy PDB format's
-  1-2 character chain-ID field allows — e.g. the symmetry-expanded names
-  a large multi-copy assembly produces (a 24-mer ferritin's chains come
-  back named things like "A-13", "A-18"). mmCIF has no such length
-  restriction, so nothing needs renaming to write it, and the exact chain
-  names rings.py/orientation.py/structure.py already reported are exactly
-  what shows up in the extracted file too — no translation table to keep
-  straight later. A legacy-PDB output option is still provided (some
-  external tools' helper scripts still only parse PDB), but writing PDB
-  requires shortening any over-length chain name to fit, so that path
-  always returns an explicit {original_name: short_name} mapping
-  alongside the file — never a silent, undiscoverable rename.
+  Since rings.py emits one row per (symmetry_type, component) rather
+  than one row per symmetry_type, a multi-component assembly (e.g. a
+  two-protein T:3,3 cage) already arrives here as multiple rows for the
+  same symmetry_type — one per component — and this module isolates
+  every row it's given (subject to the optional component_id= filter
+  below), so every structurally distinct component gets its own
+  extracted file automatically; nothing extra is needed to "pick up"
+  a second component. component_id/recommended_linker_length are carried
+  through to this module's own output (as pass-through metadata, filled
+  with None if the input df predates them) purely so a caller can still
+  see which component a given isolated file came from, and so
+  pipeline.run_rfdiffusion can default that ring's diffused-linker length
+  to its own measured geometry instead of a fixed guess.
+
+- Output format: legacy PDB is symbro's TRUE default in practice — RFdiffusion,
+  the very next stage every isolated ring feeds into, only accepts PDB
+  input, and `symbro isolate`/from_rings() both default file_format to
+  "pdb" accordingly (_write_ring_structure()/extract_ring_structure()/
+  isolate_assembly_rings() still individually default to "cif" — call one
+  of those directly if you want that instead, e.g. for a non-RFdiffusion
+  destination). mmCIF remains available (file_format="cif") for the case
+  that motivated offering it at all: RCSB assembly files commonly carry
+  chain names longer than the legacy PDB format's 1-2 character chain-ID
+  field allows — e.g. the symmetry-expanded names a large multi-copy
+  assembly produces (a 24-mer ferritin's chains come back named things
+  like "A-13", "A-18"). mmCIF has no such length restriction, so nothing
+  needs renaming to write it, and the exact chain names rings.py/
+  orientation.py/structure.py already reported are exactly what shows up
+  in the extracted file too — no translation table to keep straight
+  later. Writing PDB, by contrast, requires shortening any over-length
+  chain name to fit, so that path always returns an explicit
+  {original_name: short_name} mapping alongside the file — never a
+  silent, undiscoverable rename.
 
 - Follows download.py's "workspace-visible scratch folder" philosophy,
   under its own name: temporary_subunits/ (a sibling of download.py's
@@ -68,7 +89,15 @@ from toolkit.paths import resolve_path, to_portable
 TEMP_SUBUNITS_DIR_NAME: str = "temporary_subunits"
 
 _REQUIRED_COLUMNS: Tuple[str, ...] = ("assembly_id", "symmetry_type", "chain_groups")
-_OUTPUT_COLUMNS: Tuple[str, ...] = ("assembly_id", "symmetry_type", "chain_groups", "filepath", "chain_rename_map")
+# component_id/recommended_linker_length are optional pass-through --
+# present on any rings_df from the current rings.py, None if the caller
+# supplies an older df that predates them (see rings.py's module
+# docstring for why they exist: scoping ring exclusivity per identity
+# component rather than pooling every component together).
+_OUTPUT_COLUMNS: Tuple[str, ...] = (
+    "assembly_id", "symmetry_type", "component_id", "chain_groups",
+    "recommended_linker_length", "filepath", "chain_rename_map",
+)
 
 _SANITIZE_CHARS: str = '/\\:*?"<>|'
 
@@ -286,9 +315,11 @@ def isolate_assembly_rings(
     reported and skipped (fail-soft, same convention as the rest of this
     project) rather than aborting the other rows.
 
-    Returns a DataFrame (assembly_id, symmetry_type, chain_groups,
-    filepath, chain_rename_map) — one row per successfully extracted
-    ring. Empty (but correctly-columned) if nothing was extracted.
+    Returns a DataFrame (assembly_id, symmetry_type, component_id,
+    chain_groups, recommended_linker_length, filepath, chain_rename_map)
+    — one row per successfully extracted ring (component_id/
+    recommended_linker_length are None if rings_df predates them).
+    Empty (but correctly-columned) if nothing was extracted.
     """
     _validate_ring_df(rings_df)
 
@@ -313,7 +344,9 @@ def isolate_assembly_rings(
         rows.append({
             "assembly_id": row_assembly_id,
             "symmetry_type": symmetry_type,
+            "component_id": row.get("component_id"),  # pandas Series.get() -- None if the column is absent
             "chain_groups": chain_group,
+            "recommended_linker_length": row.get("recommended_linker_length"),
             # Stored relative to the current working directory (see
             # paths.py) so rings.pkl survives a move to another machine --
             # resolved back to absolute by _load_single_model() (and, for
@@ -331,6 +364,7 @@ def isolate_assembly_rings(
 
 def from_rings(
     rings_df: pd.DataFrame, structures: Union[pd.DataFrame, Dict[str, str]], symmetry_type: Optional[str] = None,
+    component_id: Optional[int] = None,
     filepath_column: str = "filepath", assembly_id_column: str = "assembly_id",
     output_dir: Optional[str] = None, file_format: str = "pdb",
 ) -> pd.DataFrame:
@@ -360,24 +394,50 @@ def from_rings(
         isolate every row regardless of order — the natural choice once
         you've already filtered rings_df down to exactly the rows you
         want extracted.
+    component_id : optionally narrow to ONE structurally distinct
+        component first (rings.py's component_id — see its module
+        docstring), e.g. to isolate only one protein of a multi-component
+        cage instead of every component found. Pass None (default) to
+        isolate every component — the right choice for most callers,
+        since each component is a genuinely different ring that normally
+        DOES need its own RFdiffusion/ProteinMPNN run. Raises ValueError
+        if rings_df has no component_id column (i.e. it predates
+        rings.py's per-component grouping) — there's nothing to filter on.
     output_dir  : defaults to temporary_subunits/ in the current working
         directory (get_temp_subunits_dir()).
-    file_format : "cif" (default) or "pdb" — see module docstring.
+    file_format : "pdb" (default here — RFdiffusion's own actual input
+        requirement, and what `symbro isolate` always ends up passing in
+        practice) or "cif" (module docstring's original mmCIF rationale
+        still applies if you're headed somewhere other than RFdiffusion —
+        see module docstring). Note this default deliberately differs
+        from _write_ring_structure()/extract_ring_structure()/
+        isolate_assembly_rings(), which still default to "cif" — pass
+        file_format= explicitly if you're calling one of those directly
+        and care which one you get.
 
     An assembly present in rings_df but missing from `structures`, or
     whose structure fails to load, is reported by assembly_id and
     skipped rather than aborting the whole batch — same fail-soft
     convention as the rest of this project.
 
-    Returns a DataFrame (assembly_id, symmetry_type, chain_groups,
-    filepath, chain_rename_map), one row per successfully extracted
-    ring. Empty (but correctly-columned) if nothing was extracted.
+    Returns a DataFrame (assembly_id, symmetry_type, component_id,
+    chain_groups, recommended_linker_length, filepath, chain_rename_map),
+    one row per successfully extracted ring. Empty (but correctly-
+    columned) if nothing was extracted.
     """
     _validate_ring_df(rings_df)
 
     subset = rings_df
     if symmetry_type is not None:
         subset = subset[subset["symmetry_type"] == symmetry_type]
+    if component_id is not None:
+        if "component_id" not in subset.columns:
+            raise ValueError(
+                "component_id filter was given, but rings_df has no 'component_id' column -- "
+                "it predates rings.py's per-component grouping (see rings.py's module docstring), "
+                "so there's nothing to filter on. Re-run `symbro geometry` to regenerate it."
+            )
+        subset = subset[subset["component_id"] == component_id]
     subset = subset.reset_index(drop=True)
 
     if subset.empty:

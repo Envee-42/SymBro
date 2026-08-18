@@ -15,6 +15,7 @@ Typical workflow, run in order:
                          unless --detach, which needs backend='slurm')
     symbro status        check on --detach'd RFdiffusion jobs
     symbro pmpnn         run ProteinMPNN against each assembly's best design(s)
+    symbro predict       fold candidates back (boltz/af2/af3) and screen by self-consistency
     symbro clean         clear scratch files + checkpoints between runs
 
 Each command picks up automatically where the previous one left off (via
@@ -126,14 +127,20 @@ def _summarize(df, empty_hint: str, max_cols: int = 12) -> None:
         console.print(f"  ({len(df.columns) - max_cols} more column(s) not shown here -- see the .csv)")
 
 
-def _parse_criterion(raw: str) -> dict:
+def _parse_criterion(raw: str, flag_name: str = "--criterion") -> dict:
     """Parses "attribute=value:operator" (operator optional, defaults to exact_match).
 
     A comma-separated value becomes a list (e.g. "in" matching); with
     operator "range", exactly two comma-separated numbers are required.
+
+    flag_name : which CLI flag to name in error messages -- shared by both
+        --criterion (search-time) and --filter (post-fetch), which use this
+        identical raw-string syntax; passing the actual flag the user typed
+        keeps a bad-input error pointing at the right option instead of
+        always blaming --criterion.
     """
     if "=" not in raw:
-        raise ValueError(f'--criterion "{raw}" is missing "=" -- expected format: attribute=value[:operator]')
+        raise ValueError(f'{flag_name} "{raw}" is missing "=" -- expected format: attribute=value[:operator]')
     attribute, rest = raw.split("=", 1)
     if ":" in rest:
         value_part, operator = rest.rsplit(":", 1)
@@ -143,11 +150,11 @@ def _parse_criterion(raw: str) -> dict:
     if operator == "range":
         parts = [p.strip() for p in value_part.split(",")]
         if len(parts) != 2:
-            raise ValueError(f'--criterion "{raw}": operator "range" needs exactly two comma-separated numbers, e.g. resolution=0,3:range')
+            raise ValueError(f'{flag_name} "{raw}": operator "range" needs exactly two comma-separated numbers, e.g. resolution=0,3:range')
         try:
             value = (float(parts[0]), float(parts[1]))
         except ValueError:
-            raise ValueError(f'--criterion "{raw}": range values must be numbers') from None
+            raise ValueError(f'{flag_name} "{raw}": range values must be numbers') from None
     elif "," in value_part:
         value = [p.strip() for p in value_part.split(",")]
     else:
@@ -175,9 +182,20 @@ def query(
         help='Advanced: raw "attribute=value[:operator]" search criterion (repeatable). '
              'e.g. --criterion "experimental_method=X-RAY DIFFRACTION"',
     ),
-    match: str = typer.Option("and", help="How to combine all the above: 'and' or 'or'."),
+    match: str = typer.Option(
+        "and", help="How to combine all the above: 'and' or 'or'. Applied separately to "
+                    "--filter (below), not jointly across the two."
+    ),
     fetch_field: Optional[List[str]] = typer.Option(
         None, "--fetch-field", help="Extra metadata field to include in the result (repeatable)."
+    ),
+    metadata_filter: Optional[List[str]] = typer.Option(
+        None, "--filter",
+        help='Advanced: raw "attribute=value[:operator]" filter, same syntax as --criterion, '
+             'applied AFTER results are fetched rather than sent to RCSB\'s search (repeatable). '
+             'Use this for fetch-only attributes -- e.g. model_quality -- that have no Search '
+             'API equivalent and can never appear in --criterion. '
+             'e.g. --filter "model_quality=70:greater_or_equal"',
     ),
     return_type: str = typer.Option("assembly", help="'assembly' or 'entry'."),
 ):
@@ -190,10 +208,11 @@ def query(
 
     try:
         extra_criteria = [_parse_criterion(c) for c in (criterion or [])]
+        filter_criteria = [_parse_criterion(c, flag_name="--filter") for c in (metadata_filter or [])]
         df = pipeline.run_query(
             symmetry=symmetry, entry_id=entry_id, resolution_range=resolution_range,
             description=description, extra_criteria=extra_criteria, match=match,
-            fetch_fields=fetch_field, return_type=return_type,
+            fetch_fields=fetch_field, filter_criteria=filter_criteria, return_type=return_type,
             state_dir=ctx.obj["state_dir"],
         )
     except ValueError as exc:
@@ -204,7 +223,7 @@ def query(
         _fail(f"Search failed: {exc}")
 
     console.print(f"[bold green]✓[/bold green] Found {len(df)} candidate(s).")
-    _summarize(df, empty_hint="Try loosening your search criteria.")
+    _summarize(df, empty_hint="Try loosening your search criteria or --filter.")
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/candidates.pkl[/cyan] (preview: candidates.csv)")
         console.print("  Next: [bold]symbro download[/bold]")
@@ -256,20 +275,27 @@ def geometry(
         _fail(f"Geometry analysis failed: {exc}")
 
     if symmetry_type is None:
-        counts = pipeline.detected_symmetry_types(df)
-        if counts.empty:
+        summary = pipeline.detected_symmetry_types(df)
+        if summary.empty:
             console.print("[yellow]No symmetry rings detected in any downloaded structure.[/yellow]")
         else:
             console.print("[bold green]✓[/bold green] Symmetry types detected:")
             table = Table(show_header=True, header_style="bold cyan")
             table.add_column("symmetry_type")
             table.add_column("assemblies", justify="right")
-            for sym, count in counts.items():
-                table.add_row(sym, str(count))
+            table.add_column("components", justify="right")
+            table.add_column("total_axis_count", justify="right")
+            for _, row in summary.iterrows():
+                table.add_row(
+                    row["symmetry_type"], str(row["assemblies"]), str(row["components"]), str(row["total_axis_count"]),
+                )
             console.print(table)
+            console.print("  [dim]\"components\" > \"assemblies\" for a symmetry_type means at least one "
+                           "assembly has more than one structurally distinct component at that order -- "
+                           "e.g. a two-protein cage -- each of which will get its own row/file downstream.[/dim]")
             console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/geometry.pkl[/cyan] (preview: geometry.csv)")
             console.print("  Next: re-run with [bold]--symmetry-type[/bold] on one of the above, e.g. "
-                           f"[bold]symbro geometry --symmetry-type {counts.index[0]}[/bold]")
+                           f"[bold]symbro geometry --symmetry-type {summary.iloc[0]['symmetry_type']}[/bold]")
     else:
         console.print(f"[bold green]✓[/bold green] {len(df)} assembly/assemblies with {symmetry_type} symmetry.")
         _summarize(df, empty_hint=f"No assemblies had {symmetry_type} symmetry -- try a different --symmetry-type.")
@@ -285,18 +311,29 @@ def isolate(
         None, help="Narrow to one symmetry order first. Only needed if `symbro geometry` "
                     "was run without --symmetry-type."
     ),
+    component_id: Optional[int] = typer.Option(
+        None, help="Only isolate this one structurally distinct component (see `symbro geometry`'s "
+                    "'components' count) instead of every component found -- e.g. to extract just one "
+                    "protein of a multi-component cage. Default: isolate every component."
+    ),
     file_format: str = typer.Option("pdb", help="'pdb' or 'cif'. RFdiffusion expects 'pdb'."),
     output_dir: Optional[str] = typer.Option(
         None, help="Where to write extracted ring structures (default: temporary_subunits/)."
     ),
 ):
-    """Extract each candidate's ring structure -- the files RFdiffusion needs next."""
+    """Extract each candidate's ring structure(s) -- the files RFdiffusion needs next.
+
+    A multi-component assembly (e.g. a two-protein cage) extracts one file per component by
+    default -- narrow to a single one with --component-id.
+    """
     try:
         df = pipeline.run_isolate(
-            symmetry_type=symmetry_type, file_format=file_format,
+            symmetry_type=symmetry_type, component_id=component_id, file_format=file_format,
             output_dir=output_dir, state_dir=ctx.obj["state_dir"],
         )
     except pipeline.StageNotFoundError as exc:
+        _fail(str(exc))
+    except (ValueError,) as exc:
         _fail(str(exc))
     except typer.Exit:
         raise
@@ -304,7 +341,7 @@ def isolate(
         _fail(f"Isolating rings failed: {exc}")
 
     console.print(f"[bold green]✓[/bold green] Extracted {len(df)} ring structure(s).")
-    _summarize(df, empty_hint="Try a different --symmetry-type, or check `symbro geometry`'s output.")
+    _summarize(df, empty_hint="Try a different --symmetry-type/--component-id, or check `symbro geometry`'s output.")
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/rings.pkl[/cyan] (preview: rings.csv)")
         console.print("  Next: [bold]symbro rfdiffusion[/bold]")
@@ -316,8 +353,15 @@ def rfdiffusion(
     assembly_id: Optional[str] = typer.Option(
         None, help="Only submit this assembly's ring (default: every row in rings.pkl)."
     ),
-    linker_min: int = typer.Option(15, help="Diffused linker min length (residues)."),
-    linker_max: int = typer.Option(25, help="Diffused linker max length (residues)."),
+    linker_min: Optional[int] = typer.Option(
+        None, help="Diffused linker min length (residues). Default: each ring's own "
+                    "geometry-informed recommendation from `symbro geometry` (see its "
+                    "recommended_linker_length column) -- pass both --linker-min and "
+                    "--linker-max together to override with a fixed range for every job instead."
+    ),
+    linker_max: Optional[int] = typer.Option(
+        None, help="Diffused linker max length (residues). See --linker-min."
+    ),
     num_designs: int = typer.Option(10, help="How many designs each assembly's job should produce."),
     diffuser_t: int = typer.Option(50, "--diffuser-t", help="RFdiffusion's diffuser.T (noise steps)."),
     backend: Optional[str] = typer.Option(
@@ -336,10 +380,20 @@ def rfdiffusion(
                     "status` afterward, local/singularity jobs may not (see the warning if it happens)."
     ),
 ):
-    """Submit RFdiffusion -- one job per assembly in `symbro isolate`'s output."""
+    """Submit RFdiffusion -- one job per (assembly, component) row in `symbro isolate`'s output.
+
+    Diffused linker length defaults to each ring's own geometry-informed recommendation
+    unless both --linker-min and --linker-max are given, which then apply uniformly to
+    every job instead.
+    """
+    if (linker_min is None) != (linker_max is None):
+        _fail("--linker-min and --linker-max must be given together (or neither, to use each "
+              "ring's own geometry-informed recommendation).")
+    linker_length = (linker_min, linker_max) if linker_min is not None else None
+
     try:
         df = pipeline.run_rfdiffusion(
-            assembly_id=assembly_id, linker_length=(linker_min, linker_max),
+            assembly_id=assembly_id, linker_length=linker_length,
             num_designs=num_designs, diffuser_T=diffuser_t, backend=backend,
             detach=detach, poll_interval=poll_interval, timeout=timeout,
             state_dir=ctx.obj["state_dir"],
@@ -361,7 +415,7 @@ def rfdiffusion(
         preview = df.copy()
         preview["slurm_job_id"] = preview["run"].apply(lambda r: r.slurm_job_id or "—")
         preview["designs_written"] = preview["design_paths"].apply(len)
-        preview = preview[["assembly_id", "symmetry_type", "state", "slurm_job_id", "designs_written"]]
+        preview = preview[["assembly_id", "symmetry_type", "component_id", "state", "slurm_job_id", "designs_written"]]
         _summarize(preview, empty_hint="")
     else:
         _summarize(df, empty_hint="")
@@ -391,7 +445,7 @@ def status(ctx: typer.Context):
         f"[bold green]✓[/bold green] {len(df)} RFdiffusion job(s) tracked, "
         f"{len(still_running)} still running."
     )
-    preview = df[["assembly_id", "symmetry_type", "state", "design_paths"]].copy()
+    preview = df[["assembly_id", "symmetry_type", "component_id", "state", "design_paths"]].copy()
     preview["design_paths"] = preview["design_paths"].apply(len)
     preview = preview.rename(columns={"design_paths": "designs_written"})
     _summarize(preview, empty_hint="")
@@ -403,13 +457,20 @@ def status(ctx: typer.Context):
 def pmpnn(
     ctx: typer.Context,
     assembly_id: Optional[str] = typer.Option(
-        None, help="Only run this assembly (default: every completed row in rfdiffusion.pkl)."
+        None, help="Only run this assembly (default: every completed row in rfdiffusion.pkl). A "
+                    "multi-component assembly may still match more than one row -- narrow further "
+                    "with --component-id."
     ),
-    top_n: int = typer.Option(1, help="Submit only the top N RFdiffusion designs per assembly, by pLDDT."),
+    component_id: Optional[int] = typer.Option(
+        None, help="Only run this one structurally distinct component of --assembly-id (see "
+                    "`symbro geometry`'s 'components' count)."
+    ),
+    top_n: int = typer.Option(1, help="Submit only the top N RFdiffusion designs per row, by pLDDT."),
     min_plddt: Optional[float] = typer.Option(None, help="Also require at least this mean pLDDT."),
     select: Optional[List[str]] = typer.Option(
         None, "--select", help="Explicit design PDB path (repeatable) -- bypasses --top-n/"
-                                "--min-plddt entirely. Requires --assembly-id."
+                                "--min-plddt entirely. Requires --assembly-id (and --component-id "
+                                "for a multi-component assembly)."
     ),
     num_seq_per_target: int = typer.Option(8, help="ProteinMPNN sequences per selected design."),
     sampling_temp: float = typer.Option(0.1, help="ProteinMPNN sampling temperature."),
@@ -424,7 +485,7 @@ def pmpnn(
     """Run ProteinMPNN against each assembly's best RFdiffusion design(s)."""
     try:
         df = pipeline.run_pmpnn(
-            assembly_id=assembly_id, top_n=top_n, min_plddt=min_plddt, select=select,
+            assembly_id=assembly_id, component_id=component_id, top_n=top_n, min_plddt=min_plddt, select=select,
             num_seq_per_target=num_seq_per_target, sampling_temp=sampling_temp,
             batch_size=batch_size, poll_interval=poll_interval, timeout=timeout,
             state_dir=ctx.obj["state_dir"],
@@ -442,7 +503,70 @@ def pmpnn(
     _summarize(df, empty_hint="No assembly had a completed RFdiffusion job ready -- check `symbro status`.")
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/pmpnn.pkl[/cyan] (preview: pmpnn.csv)")
-        console.print("  Structure-prediction screening commands are coming in the next round.")
+        console.print("  Next: [bold]symbro predict[/bold]")
+
+
+@app.command()
+def predict(
+    ctx: typer.Context,
+    predictor: Optional[str] = typer.Option(
+        None, help="'boltz', 'af2'/'alphafold2', or 'af3'/'alphafold3' -- default: installation.yaml's "
+                    "structure_prediction.default."
+    ),
+    assembly_id: Optional[str] = typer.Option(
+        None, help="Only screen this assembly (default: every row in pmpnn.pkl). A multi-component "
+                    "assembly may still match more than one row -- narrow further with --component-id."
+    ),
+    component_id: Optional[int] = typer.Option(
+        None, help="Only screen this one structurally distinct component of --assembly-id."
+    ),
+    top_n: int = typer.Option(3, help="Shortlist size per (assembly, component), by ProteinMPNN's own score."),
+    max_rmsd: float = typer.Option(2.0, help="Max CA-RMSD (Angstrom) against the RFdiffusion backbone to pass."),
+    min_plddt: float = typer.Option(70.0, help="Min mean pLDDT to pass."),
+    backend: Optional[str] = typer.Option(
+        None, help="'local', 'singularity', or 'slurm' -- default: installation.yaml's <predictor>.backend."
+    ),
+    af3_model_dir: Optional[str] = typer.Option(
+        None, "--af3-model-dir", help="AF3 only -- default: installation.yaml's af3.model_dir."
+    ),
+    af3_db_dir: Optional[str] = typer.Option(
+        None, "--af3-db-dir", help="AF3 only -- default: installation.yaml's af3.db_dir."
+    ),
+    af3_run_data_pipeline: Optional[bool] = typer.Option(
+        None, "--af3-run-data-pipeline/--af3-no-data-pipeline",
+        help="AF3 only -- default: installation.yaml's af3.run_data_pipeline, or af3.py's own "
+             "default (True) if that's unset too."
+    ),
+    af3_terms_acknowledged: bool = typer.Option(
+        False, "--af3-terms-acknowledged",
+        help="AF3 only -- confirms you've read https://github.com/google-deepmind/alphafold3/blob/"
+             "main/WEIGHTS_TERMS_OF_USE.md. Ignored for boltz/af2. Can also be set once via "
+             "installation.yaml's af3.terms_acknowledged."
+    ),
+):
+    """Fold ProteinMPNN's best candidate(s) back and screen by self-consistency (RMSD/pLDDT)."""
+    try:
+        df = pipeline.run_predict(
+            predictor=predictor, assembly_id=assembly_id, component_id=component_id,
+            top_n=top_n, max_rmsd=max_rmsd, min_plddt=min_plddt, backend=backend,
+            af3_model_dir=af3_model_dir, af3_db_dir=af3_db_dir,
+            af3_terms_acknowledged=af3_terms_acknowledged, af3_run_data_pipeline=af3_run_data_pipeline,
+            state_dir=ctx.obj["state_dir"],
+        )
+    except pipeline.StageNotFoundError as exc:
+        _fail(str(exc))
+    except (ValueError, RuntimeError) as exc:
+        _fail(f"Structure prediction failed: {exc}")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"Structure prediction failed: {exc}")
+
+    console.print(f"[bold green]✓[/bold green] {len(df)} candidate(s) passed self-consistency screening.")
+    _summarize(df, empty_hint="No candidate passed --max-rmsd/--min-plddt -- check `symbro pmpnn`'s own output, "
+                               "or loosen those thresholds.")
+    if not df.empty:
+        console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/predict.pkl[/cyan] (preview: predict.csv)")
 
 
 @app.command()

@@ -53,6 +53,7 @@ GEOMETRY_STAGE = "geometry"
 ISOLATE_STAGE = "rings"
 RFDIFFUSION_STAGE = "rfdiffusion"
 PMPNN_STAGE = "pmpnn"
+PREDICT_STAGE = "predict"
 
 # poll_status() states that mean "this job is done, one way or another" --
 # shared by both the RFdiffusion and ProteinMPNN polling loops below.
@@ -142,6 +143,7 @@ def run_query(
     extra_criteria: Optional[Sequence[dict]] = None,
     match: str = "and",
     fetch_fields: Optional[Sequence[str]] = None,
+    filter_criteria: Optional[Sequence[dict]] = None,
     return_type: str = "assembly",
     state_dir: str = DEFAULT_STATE_DIR,
 ) -> pd.DataFrame:
@@ -149,6 +151,17 @@ def run_query(
     Search RCSB PDB for candidates. At least one of symmetry / entry_id /
     resolution_range / description / extra_criteria must be given, or
     every criterion in the search would be unconstrained.
+
+    filter_criteria : optional list of {"attribute", "value", "operator"}
+        dicts (same shape as extra_criteria), applied locally via
+        query.filter_metadata() AFTER the RCSB fetch, instead of being
+        sent to RCSB's own Search API. This is the only way to filter on a
+        FETCH_ONLY_ATTRIBUTES field (e.g. model_quality) -- those have no
+        Search API equivalent at all, so they can never appear in
+        extra_criteria/search_criteria. Does NOT count toward the "at
+        least one search criterion" requirement above -- it only narrows
+        results a real search criterion has already fetched, so it can't
+        by itself constrain an otherwise-unbounded search.
 
     Saves the result to <state_dir>/candidates.{pkl,csv} and returns it
     (empty DataFrame if nothing matched -- not an error).
@@ -160,7 +173,9 @@ def run_query(
     if not (symmetry or entry_id or resolution_range or description or extra_criteria):
         raise ValueError(
             "No search criteria given -- provide at least one of symmetry, "
-            "entry_id, resolution_range, description, or extra_criteria."
+            "entry_id, resolution_range, description, or extra_criteria. "
+            "(filter_criteria alone doesn't count -- it only narrows an "
+            "already-constrained search.)"
         )
 
     from toolkit import query as _query
@@ -169,6 +184,7 @@ def run_query(
     df = _query.query_candidates(
         search_criteria=criteria,
         fetch_fields=list(fetch_fields) if fetch_fields else None,
+        filter_criteria=list(filter_criteria) if filter_criteria else None,
         mode=match,
         return_type=return_type,
     )
@@ -246,20 +262,60 @@ def run_geometry(
         return orientation_df
 
     termini_df = _structure.from_rings(rings_df, downloaded_df, symmetry_type)
+    # Merge key includes chain_groups, not just (assembly_id,
+    # symmetry_type): since rings.py started emitting one row per
+    # (order, identity component) rather than one row per order (see
+    # rings.py's module docstring), a multi-component assembly now has
+    # MULTIPLE rows sharing the same (assembly_id, symmetry_type) --
+    # merging on those two columns alone would cross-join every
+    # component's orientation row against every component's termini_ss
+    # row instead of pairing each component with its own. chain_groups is
+    # unique per row within one assembly's own symmetry_type (different
+    # components/duplicates always differ in actual chain composition),
+    # so adding it here restores a correct one-to-one merge.
     merged = orientation_df.merge(
-        termini_df[["assembly_id", "symmetry_type", "termini_ss"]],
-        on=["assembly_id", "symmetry_type"],
+        termini_df[["assembly_id", "symmetry_type", "chain_groups", "termini_ss"]],
+        on=["assembly_id", "symmetry_type", "chain_groups"],
         how="left",
     )
     save_checkpoint(merged, GEOMETRY_STAGE, state_dir)
     return merged
 
 
-def detected_symmetry_types(rings_df: pd.DataFrame) -> pd.Series:
-    """Counts of assemblies found per symmetry_type -- for printing a friendly summary."""
+def detected_symmetry_types(rings_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summary of what ring detection found, per symmetry_type -- for
+    printing a friendly overview before committing to one --symmetry-type.
+
+    Returns a DataFrame with columns:
+      symmetry_type, assemblies (distinct assembly_id count), components
+      (row count -- one per structurally distinct identity component
+      detected per assembly; see rings.py's module docstring. Equal to
+      `assemblies` for single-component/homomeric cages, greater than it
+      for multi-component ones, e.g. a two-protein T:3,3 cage has 2
+      components for its C3 rows), total_axis_count (sum of axis_count
+      across all those rows -- i.e. total rings found, INCLUDING
+      same-component redundant duplicates, e.g. all 4 copies of one
+      protein's trimer in a tetrahedral cage).
+
+    Sorted by `assemblies` descending, matching this function's previous
+    (Series-returning) sort order. Empty (but correctly-columned) if
+    rings_df is empty or has no symmetry_type column.
+    """
+    columns = ["symmetry_type", "assemblies", "components", "total_axis_count"]
     if rings_df.empty or "symmetry_type" not in rings_df.columns:
-        return pd.Series(dtype=int)
-    return rings_df.groupby("symmetry_type")["assembly_id"].nunique().sort_values(ascending=False)
+        return pd.DataFrame(columns=columns)
+
+    grouped = rings_df.groupby("symmetry_type")
+    summary = pd.DataFrame({
+        "assemblies": grouped["assembly_id"].nunique(),
+        "components": grouped.size(),
+        "total_axis_count": (
+            grouped["axis_count"].sum() if "axis_count" in rings_df.columns
+            else grouped.size() * 0  # older rings_df without axis_count -- report 0, not a crash
+        ),
+    }).reset_index()
+    return summary.sort_values("assemblies", ascending=False).reset_index(drop=True)
 
 
 # ----------------------------------------------------------------------
@@ -270,15 +326,22 @@ def run_isolate(
     geometry_df: Optional[pd.DataFrame] = None,
     downloaded_df: Optional[pd.DataFrame] = None,
     symmetry_type: Optional[str] = None,
+    component_id: Optional[int] = None,
     file_format: str = "pdb",
     output_dir: Optional[str] = None,
     state_dir: str = DEFAULT_STATE_DIR,
 ) -> pd.DataFrame:
     """
-    Extracts one ring PDB (or mmCIF) per assembly into temporary_subunits/
-    (or output_dir) -- the files RFdiffusion needs next. If geometry_df /
-    downloaded_df aren't given, loads them from
+    Extracts one ring PDB (or mmCIF) per (assembly, component) into
+    temporary_subunits/ (or output_dir) -- the files RFdiffusion needs
+    next. If geometry_df / downloaded_df aren't given, loads them from
     <state_dir>/geometry.pkl and <state_dir>/downloaded.pkl.
+
+    A multi-component assembly (e.g. a two-protein T:3,3 cage -- see
+    rings.py's module docstring) isolates EVERY component by default,
+    each into its own file; pass component_id= to isolate only one
+    specific component instead (e.g. to hand just one protein of a
+    two-component cage to RFdiffusion for now).
 
     Saves the result to <state_dir>/rings.{pkl,csv} and returns it.
     """
@@ -290,7 +353,7 @@ def run_isolate(
         downloaded_df = load_checkpoint(DOWNLOADED_STAGE, state_dir, needed_by="Isolating rings")
 
     df = _isolate.from_rings(
-        geometry_df, downloaded_df, symmetry_type=symmetry_type,
+        geometry_df, downloaded_df, symmetry_type=symmetry_type, component_id=component_id,
         output_dir=output_dir, file_format=file_format,
     )
     save_checkpoint(df, ISOLATE_STAGE, state_dir)
@@ -363,10 +426,17 @@ def _poll_all_rfdiffusion(rows: list, poll_interval: int = 20, timeout: Optional
     return rows
 
 
+# Used only when linker_length=None (auto) AND the row itself has no
+# recommended_linker_length -- e.g. a rings.pkl checkpoint written by a
+# rings.py that predates estimate_linker_length(). Matches the CLI's
+# previous hardcoded default so behavior for old checkpoints is unchanged.
+_FALLBACK_LINKER_LENGTH: Tuple[int, int] = (15, 25)
+
+
 def run_rfdiffusion(
     rings_df: Optional[pd.DataFrame] = None,
     assembly_id: Optional[str] = None,
-    linker_length: Union[int, Tuple[int, int]] = (15, 25),
+    linker_length: Optional[Union[int, Tuple[int, int]]] = None,
     num_designs: int = 10,
     diffuser_T: int = 50,
     backend: Optional[str] = None,
@@ -376,12 +446,30 @@ def run_rfdiffusion(
     state_dir: str = DEFAULT_STATE_DIR,
 ) -> pd.DataFrame:
     """
-    Submits one RFdiffusion job per assembly -- batch-per-assembly, the
-    architecture decided for this stage: every assembly gets its own
-    independent job rather than one giant multi-assembly job or one job
-    per ring row (rings.pkl already has exactly one ring row per
-    assembly, the main grouping). Narrow to a single assembly with
-    assembly_id=.
+    Submits one RFdiffusion job per (assembly, component) row --
+    batch-per-row, the architecture decided for this stage: every row of
+    rings.pkl gets its own independent job rather than one giant
+    multi-assembly job. Since rings.py now emits one row per
+    (symmetry_type, identity component) rather than one row per
+    symmetry_type (see rings.py's module docstring), a multi-component
+    assembly's rows -- e.g. a two-protein T:3,3 cage's two C3 rows --
+    already submit as two separate jobs here without any special-casing:
+    this function has always iterated every row of rings_df, never
+    assumed exactly one row per assembly. Narrow to a single assembly's
+    row(s) with assembly_id= (still possibly more than one row, for a
+    multi-component assembly); narrow further at the isolate stage with
+    component_id= if only one component's job is wanted.
+
+    linker_length : (min_residues, max_residues) for RFdiffusion's
+        diffused-linker contig segment. Defaults to None, meaning
+        "auto" -- each row uses ITS OWN rings.py-computed
+        recommended_linker_length (derived from that ring's own measured
+        mean_distance; see rings.py's estimate_linker_length()) if
+        present, falling back to a fixed (15, 25) only for a row from an
+        older rings_df that predates that column. Pass an explicit
+        int or (min, max) tuple here (or via the CLI's --linker-min/
+        --linker-max) to override the recommendation for every row
+        uniformly instead.
 
     Every job is submitted FIRST (rfdiffusion.submit() dispatches
     without blocking), and only THEN polled -- this keeps multiple SLURM
@@ -403,10 +491,10 @@ def run_rfdiffusion(
     If rings_df isn't given, loads it from <state_dir>/rings.pkl (i.e.
     `symbro isolate`'s last output). Saves the result to
     <state_dir>/rfdiffusion.{pkl,csv} and returns it -- one row per
-    assembly: assembly_id, symmetry_type, chain_groups, run (a
-    picklable RFdiffusionRun -- see _poll_all_rfdiffusion()'s docstring
-    for why .process is always None by the time this is saved), state,
-    design_paths.
+    (assembly, component): assembly_id, symmetry_type, chain_groups, run
+    (a picklable RFdiffusionRun -- see _poll_all_rfdiffusion()'s
+    docstring for why .process is always None by the time this is
+    saved), state, design_paths.
     """
     from toolkit import config as _config
     from toolkit import rfdiffusion as _rfdiffusion
@@ -435,23 +523,33 @@ def run_rfdiffusion(
 
     rows = []
     for _, row in subset.iterrows():
+        if linker_length is not None:
+            row_linker_length = linker_length
+        else:
+            recommended = row.get("recommended_linker_length")
+            row_linker_length = tuple(recommended) if isinstance(recommended, (tuple, list)) else _FALLBACK_LINKER_LENGTH
         short_order = _rfdiffusion.remap_chain_order(tuple(row["chain_groups"]), row["chain_rename_map"])
         job = _rfdiffusion.prepare_fusion_job(
-            row["filepath"], short_order, linker_length=linker_length,
+            row["filepath"], short_order, linker_length=row_linker_length,
             num_designs=num_designs, diffuser_T=diffuser_T,
         )
         run = _rfdiffusion.submit(job, backend=backend, config=cfg)
         rows.append({
             "assembly_id": row["assembly_id"], "symmetry_type": row["symmetry_type"],
+            "component_id": row.get("component_id"),
             "chain_groups": tuple(row["chain_groups"]), "run": run,
             "state": "submitted", "design_paths": [],
         })
-        print(f"Submitted {row['assembly_id']}" + (f" (slurm job {run.slurm_job_id})" if run.slurm_job_id else ""))
+        component_note = f", component {row.get('component_id')}" if row.get("component_id") is not None else ""
+        print(f"Submitted {row['assembly_id']}{component_note}"
+              + (f" (slurm job {run.slurm_job_id})" if run.slurm_job_id else ""))
 
     if not detach:
         rows = _poll_all_rfdiffusion(rows, poll_interval=poll_interval, timeout=timeout)
 
-    df = pd.DataFrame(rows, columns=["assembly_id", "symmetry_type", "chain_groups", "run", "state", "design_paths"])
+    df = pd.DataFrame(
+        rows, columns=["assembly_id", "symmetry_type", "component_id", "chain_groups", "run", "state", "design_paths"],
+    )
     save_checkpoint(df, RFDIFFUSION_STAGE, state_dir)
     return df
 
@@ -490,7 +588,7 @@ def run_status(state_dir: str = DEFAULT_STATE_DIR) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 
 _PMPNN_SEQUENCE_COLUMNS: Tuple[str, ...] = (
-    "assembly_id", "source_pdb", "sequence", "is_native", "temperature",
+    "assembly_id", "component_id", "source_pdb", "sequence", "is_native", "temperature",
     "sample_index", "score", "global_score", "seq_recovery",
 )
 
@@ -498,6 +596,7 @@ _PMPNN_SEQUENCE_COLUMNS: Tuple[str, ...] = (
 def run_pmpnn(
     rfdiffusion_df: Optional[pd.DataFrame] = None,
     assembly_id: Optional[str] = None,
+    component_id: Optional[int] = None,
     top_n: int = 1,
     min_plddt: Optional[float] = None,
     select: Optional[Sequence[str]] = None,
@@ -509,25 +608,28 @@ def run_pmpnn(
     state_dir: str = DEFAULT_STATE_DIR,
 ) -> pd.DataFrame:
     """
-    Runs ProteinMPNN against each assembly's selected RFdiffusion
-    design(s) -- batch-per-assembly, one job at a time. Unlike
+    Runs ProteinMPNN against each (assembly, component)'s selected
+    RFdiffusion design(s) -- batch-per-row, one job at a time. Unlike
     RFdiffusion, ProteinMPNN has no SLURM backend (always a local,
     blocking subprocess -- see pmpnn.py's own module docstring), so
     there's no detach/status split here: this always blocks until each
-    assembly's job is done before moving to the next. Narrow to one
-    assembly with assembly_id=.
+    row's job is done before moving to the next. Narrow to one assembly
+    with assembly_id= (a multi-component assembly may still have more
+    than one matching row -- one per component); narrow further to one
+    specific component with component_id=.
 
-    For each assembly processed:
-      1. re-derives that assembly's RFdiffusionJob from its own saved
-         run (a pure, deterministic rebuild -- does NOT re-run
-         RFdiffusion) and ranks its designs via rfdiffusion.rank_designs(),
-         RFdiffusion's own per-design confidence -- this IS the "let the
-         user select which RFdiffusion models to run ProteinMPNN on
-         based on their scoring" feature.
+    For each row processed:
+      1. re-derives that row's RFdiffusionJob from its own saved run (a
+         pure, deterministic rebuild -- does NOT re-run RFdiffusion) and
+         ranks its designs via rfdiffusion.rank_designs(), RFdiffusion's
+         own per-design confidence -- this IS the "let the user select
+         which RFdiffusion models to run ProteinMPNN on based on their
+         scoring" feature.
       2. selects design(s): select= (explicit design PDB path(s),
-         repeatable -- only valid together with assembly_id=, since an
-         explicit path list can't be automatically split across
-         multiple assemblies) takes priority; otherwise top_n=/
+         repeatable -- only valid together with assembly_id= AND, for a
+         multi-component assembly, component_id= narrowing to exactly
+         one row, since an explicit path list can't be automatically
+         split across multiple jobs) takes priority; otherwise top_n=/
          min_plddt= filter the ranked table (top_n=1 by default: just
          the single best-scored design).
       3. submits + blocks-and-polls ProteinMPNN, collects sequences.
@@ -541,9 +643,14 @@ def run_pmpnn(
 
     If rfdiffusion_df isn't given, loads it from
     <state_dir>/rfdiffusion.pkl. Saves the result to
-    <state_dir>/pmpnn.{pkl,csv} and returns it -- every processed
-    assembly's sequences_df concatenated together, each row tagged with
-    its own assembly_id.
+    <state_dir>/pmpnn.{pkl,csv} and returns it -- every processed row's
+    sequences_df concatenated together, each row tagged with its own
+    assembly_id AND component_id (None if rfdiffusion_df predates
+    per-component rings -- see rings.py's module docstring). A
+    multi-component assembly (e.g. a two-protein T:3,3 cage) has more
+    than one row in rfdiffusion_df sharing the same assembly_id, one per
+    component, each processed independently here -- component_id is what
+    lets the resulting pmpnn.pkl tell those apart afterward.
     """
     import time as _time
 
@@ -559,25 +666,36 @@ def run_pmpnn(
         subset = subset[subset["assembly_id"] == assembly_id]
         if subset.empty:
             raise ValueError(f"No row for assembly_id={assembly_id!r} in the rfdiffusion checkpoint.")
+    if component_id is not None:
+        if "component_id" not in subset.columns:
+            raise ValueError(
+                "component_id filter was given, but the rfdiffusion checkpoint has no "
+                "'component_id' column -- it predates rings.py's per-component grouping."
+            )
+        subset = subset[subset["component_id"] == component_id]
+        if subset.empty:
+            raise ValueError(f"No row for assembly_id={assembly_id!r}, component_id={component_id!r}.")
     subset = subset.reset_index(drop=True)
 
     if select is not None and (assembly_id is None or len(subset) != 1):
         raise ValueError(
-            "select= (explicit design paths) requires assembly_id= to narrow to exactly one "
-            "assembly first -- an explicit path list can't be automatically split across "
-            "multiple assemblies' jobs."
+            "select= (explicit design paths) requires assembly_id= (and, for a multi-component "
+            "assembly, component_id=) to narrow to exactly one row first -- an explicit path list "
+            "can't be automatically split across multiple jobs."
         )
 
     cfg = _config.load_installation_config()
     frames = []
     for _, row in subset.iterrows():
         aid = row["assembly_id"]
+        cid = row.get("component_id")
+        label = f"{aid}" + (f" (component {cid})" if cid is not None else "")
         if row["state"] not in ("completed", "completed_partial"):
-            print(f"Skipped {aid}: RFdiffusion state is {row['state']!r}, not completed yet "
+            print(f"Skipped {label}: RFdiffusion state is {row['state']!r}, not completed yet "
                   f"(run `symbro status` first if this was a --detach'd job).")
             continue
         if not row["design_paths"]:
-            print(f"Skipped {aid}: RFdiffusion produced no design files.")
+            print(f"Skipped {label}: RFdiffusion produced no design files.")
             continue
 
         job = row["run"].job
@@ -586,16 +704,16 @@ def run_pmpnn(
             selected_abs = [os.path.abspath(p) for p in select]
             missing = [g for g, ga in zip(select, selected_abs) if ga not in ranked["design_path"].values]
             if missing:
-                raise ValueError(f"--select path(s) not among {aid}'s own designs: {missing}")
+                raise ValueError(f"--select path(s) not among {label}'s own designs: {missing}")
             selected_paths = selected_abs
         else:
             ranked = _rfdiffusion.rank_designs(row["design_paths"], top_n=top_n, min_plddt=min_plddt)
             selected_paths = ranked["design_path"].tolist()
         if not selected_paths:
-            print(f"Skipped {aid}: no designs left after top_n/min_plddt filtering.")
+            print(f"Skipped {label}: no designs left after top_n/min_plddt filtering.")
             continue
 
-        print(f"{aid}: submitting ProteinMPNN for {len(selected_paths)} design(s): "
+        print(f"{label}: submitting ProteinMPNN for {len(selected_paths)} design(s): "
               f"{[os.path.basename(p) for p in selected_paths]}")
         mpnn_job = _pmpnn.prepare_mpnn_job(
             selected_paths, rf_job=job, num_seq_per_target=num_seq_per_target,
@@ -607,21 +725,185 @@ def run_pmpnn(
         status = _pmpnn.poll_status(run)
         while status["state"] not in _TERMINAL_STATES:
             if _time.time() - start > timeout:
-                print(f"  {aid}: timed out after {timeout}s waiting for ProteinMPNN "
+                print(f"  {label}: timed out after {timeout}s waiting for ProteinMPNN "
                       f"(local process -- check {run.log_path} by hand).")
                 break
             _time.sleep(poll_interval)
             status = _pmpnn.poll_status(run)
-        print(f"  {aid}: {status['state']} "
+        print(f"  {label}: {status['state']} "
               f"({status['sequences_written']}/{status['sequences_expected']} sequences)")
 
         sequences_df = _pmpnn.collect_sequences(status)
         if not sequences_df.empty:
             sequences_df.insert(0, "assembly_id", aid)
+            sequences_df.insert(1, "component_id", cid)
             frames.append(sequences_df)
 
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=list(_PMPNN_SEQUENCE_COLUMNS))
     save_checkpoint(df, PMPNN_STAGE, state_dir)
+    return df
+
+
+# ----------------------------------------------------------------------
+# Stage 7: structure prediction (self-consistency screening, batch-per-
+# (assembly, component), always local-call-blocks-to-completion)
+# ----------------------------------------------------------------------
+
+# assembly_id/component_id/predictor (inserted by run_predict() itself) +
+# selfconsistency.collect_results()'s own column set -- kept here, same
+# convention as _PMPNN_SEQUENCE_COLUMNS above, so an empty result still
+# carries the real schema instead of a bare, columnless DataFrame.
+_PREDICT_COLUMNS: Tuple[str, ...] = (
+    "assembly_id", "component_id", "predictor", "candidate_id", "folded_path",
+    "reference_path", "rmsd_to_design", "mean_plddt",
+)
+
+
+def run_predict(
+    pmpnn_df: Optional[pd.DataFrame] = None,
+    rfdiffusion_df: Optional[pd.DataFrame] = None,
+    predictor: Optional[str] = None,
+    assembly_id: Optional[str] = None,
+    component_id: Optional[int] = None,
+    top_n: int = 3,
+    max_rmsd: float = 2.0,
+    min_plddt: float = 70.0,
+    backend: Optional[str] = None,
+    af3_model_dir: Optional[str] = None,
+    af3_db_dir: Optional[str] = None,
+    af3_terms_acknowledged: bool = False,
+    af3_run_data_pipeline: Optional[bool] = None,
+    state_dir: str = DEFAULT_STATE_DIR,
+) -> pd.DataFrame:
+    """
+    Folds ProteinMPNN's best candidate(s) per (assembly, component) back
+    with a structure-prediction backend (see structure_prediction.py:
+    "boltz"/"af2"/"alphafold2"/"af3"/"alphafold3", or None for
+    installation.yaml's structure_prediction.default) and screens them by
+    self-consistency (CA-RMSD + pLDDT against the RFdiffusion backbone
+    they were designed on) -- the pipeline's final validation step.
+
+    Unlike run_rfdiffusion()/run_pmpnn(), there's no manual poll loop
+    here: alphafold2.run()/boltz.run()/af3.run() already do
+    prepare-submit-poll-collect-validate as ONE blocking call.
+
+    design_paths (the RFdiffusion PDBs each candidate must be compared
+    against) are recovered from rfdiffusion_df's own design_paths column,
+    joined on (assembly_id, component_id) -- the SAME row run_pmpnn()
+    itself read to build ProteinMPNN's input. Deliberately not
+    reconstructed from ProteinMPNN's staged input directory the way the
+    older standalone run_predictor.py script did: that directory is only
+    ever valid for the MOST RECENTLY run assembly (pmpnn.py's own
+    _stage_input_pdbs() clears/overwrites it at the start of every next
+    submit() against the same out_folder), so it silently breaks for any
+    other assembly. Reading it back off rfdiffusion_df instead works
+    regardless of how many assemblies have been run since.
+
+    If pmpnn_df/rfdiffusion_df aren't given, loads them from
+    <state_dir>/pmpnn.pkl and <state_dir>/rfdiffusion.pkl. Saves the
+    result to <state_dir>/predict.{pkl,csv} and returns it -- every
+    validated candidate across every processed (assembly, component),
+    tagged with predictor/assembly_id/component_id.
+
+    af3_model_dir/af3_db_dir/af3_terms_acknowledged/af3_run_data_pipeline
+    are ignored for every predictor except af3/alphafold3. Unlike
+    terms_acknowledged (which af3.run() itself already falls back to
+    installation.yaml's af3.terms_acknowledged for), model_dir/db_dir/
+    run_data_pipeline have NO such fallback inside af3.run() -- its
+    model_dir parameter has no default at all -- so this function
+    resolves them from installation.yaml's own af3: section first.
+
+    An (assembly, component) is skipped (reported, not fatal to the rest
+    of the batch -- same fail-soft convention as run_pmpnn) if it has no
+    row in the rfdiffusion checkpoint, that row has no design_paths, or
+    the predictor call itself raises RuntimeError (a failed job -- see
+    the printed log_path).
+    """
+    from toolkit import config as _config
+    from toolkit import pmpnn as _pmpnn
+    from toolkit import structure_prediction as _structure_prediction
+
+    if pmpnn_df is None:
+        pmpnn_df = load_checkpoint(PMPNN_STAGE, state_dir, needed_by="Running structure prediction")
+    if rfdiffusion_df is None:
+        rfdiffusion_df = load_checkpoint(RFDIFFUSION_STAGE, state_dir, needed_by="Running structure prediction")
+
+    subset = pmpnn_df
+    if assembly_id is not None:
+        subset = subset[subset["assembly_id"] == assembly_id]
+        if subset.empty:
+            raise ValueError(f"No row for assembly_id={assembly_id!r} in the pmpnn checkpoint.")
+    if component_id is not None:
+        subset = subset[subset["component_id"] == component_id]
+        if subset.empty:
+            raise ValueError(f"No row for assembly_id={assembly_id!r}, component_id={component_id!r}.")
+
+    cfg = _config.load_installation_config()
+    resolved_predictor = predictor or _config.get_tool_config(cfg, "structure_prediction").get("default")
+
+    predictor_kwargs = {}
+    if resolved_predictor and resolved_predictor.lower() in ("af3", "alphafold3"):
+        af3_cfg = _config.get_tool_config(cfg, "af3")
+        predictor_kwargs["model_dir"] = af3_model_dir or af3_cfg.get("model_dir")
+        predictor_kwargs["db_dir"] = af3_db_dir or af3_cfg.get("db_dir")
+        predictor_kwargs["terms_acknowledged"] = af3_terms_acknowledged or bool(af3_cfg.get("terms_acknowledged", False))
+        run_data_pipeline = af3_run_data_pipeline
+        if run_data_pipeline is None:
+            run_data_pipeline = af3_cfg.get("run_data_pipeline")
+        if run_data_pipeline is not None:
+            predictor_kwargs["run_data_pipeline"] = run_data_pipeline
+
+    frames = []
+    for (aid, cid), group_df in subset.groupby(["assembly_id", "component_id"], dropna=False, sort=False):
+        label = f"{aid}" + (f" (component {cid})" if pd.notna(cid) else "")
+        same_assembly = rfdiffusion_df["assembly_id"] == aid
+        if "component_id" in rfdiffusion_df.columns:
+            # groupby(dropna=False) hands back a float nan for a missing
+            # component_id (the common case: a single-component assembly),
+            # never the original None -- comparing that nan against
+            # rfdiffusion_df's own component_id column with plain == is
+            # always False (NaN != NaN, and NaN != None too), even when the
+            # "same" None/NaN row is right there. pd.isna() on both sides
+            # is what actually matches it -- confirmed against a minimal
+            # single-assembly reproduction of this exact shape, which
+            # matched 0 rows with == and 1 row with this fix.
+            cid_match = rfdiffusion_df["component_id"].isna() if pd.isna(cid) else rfdiffusion_df["component_id"] == cid
+            rf_rows = rfdiffusion_df[same_assembly & cid_match]
+        else:
+            rf_rows = rfdiffusion_df[same_assembly]
+        if rf_rows.empty:
+            print(f"Skipped {label}: no matching row in the rfdiffusion checkpoint.")
+            continue
+        design_paths = rf_rows.iloc[0]["design_paths"]
+        if not design_paths:
+            print(f"Skipped {label}: RFdiffusion row has no design_paths.")
+            continue
+
+        shortlist = _pmpnn.select_best_designs(group_df, top_n=top_n)
+        if shortlist.empty:
+            print(f"Skipped {label}: no candidates left after top_n filtering.")
+            continue
+
+        print(f"{label}: screening {len(shortlist)} candidate(s) with {resolved_predictor!r}.")
+        try:
+            winners = _structure_prediction.run(
+                predictor, shortlist, design_paths, config=cfg, backend=backend,
+                max_rmsd=max_rmsd, min_plddt=min_plddt, **predictor_kwargs,
+            )
+        except RuntimeError as exc:
+            print(f"  {label}: predictor run failed: {exc}")
+            continue
+
+        print(f"  {label}: {len(winners)}/{len(shortlist)} candidate(s) passed self-consistency screening.")
+        if not winners.empty:
+            winners = winners.copy()
+            winners.insert(0, "assembly_id", aid)
+            winners.insert(1, "component_id", cid)
+            winners.insert(2, "predictor", resolved_predictor)
+            frames.append(winners)
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=list(_PREDICT_COLUMNS))
+    save_checkpoint(df, PREDICT_STAGE, state_dir)
     return df
 
 
@@ -631,6 +913,7 @@ def run_pmpnn(
 
 _ALL_STAGES: Tuple[str, ...] = (
     CANDIDATES_STAGE, DOWNLOADED_STAGE, GEOMETRY_STAGE, ISOLATE_STAGE, RFDIFFUSION_STAGE, PMPNN_STAGE,
+    PREDICT_STAGE,
 )
 
 

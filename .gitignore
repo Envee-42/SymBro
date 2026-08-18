@@ -1,6 +1,9 @@
 /data/
 .ipynb_checkpoints/
 .venv/
+/sym-env/
+venv/
+env/
 __pycache__/
 /temporary_files/
 /temporary_subunits/

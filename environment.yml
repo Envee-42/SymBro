@@ -7,15 +7,17 @@
 # rcsb-api has no conda-forge package, so it (and the project itself,
 # in editable mode) are installed via pip inside the conda env.
 #
-# ProteinMPNN needs plain torch (CPU is fine -- see pyproject.toml's own
-# [project.optional-dependencies] comment for why it's the one external
-# tool listed there) -- not included below to keep this base env light for
-# anyone not running that stage; add it yourself via `pip install
-# -e ".[proteinmpnn]"` inside this env, or `conda install pytorch
-# torchvision torchaudio cpuonly -c pytorch` if you'd rather get it from
-# conda-forge/pytorch's own channel instead.
+# torch (for ProteinMPNN -- see pyproject.toml's own comment for why it's
+# a base dependency, not RFdiffusion-style fully external) is pulled from
+# the `pytorch` channel with `cpuonly` pinned, so this stays a lean CPU
+# build by default rather than however conda would otherwise resolve a
+# generic `pytorch` spec (which can mean a large CUDA build). If you
+# specifically want a CUDA build on this machine, drop `cpuonly` and
+# install the matching `pytorch-cuda=<version>` package for your GPU
+# instead -- see pytorch.org's own install matrix.
 name: symbro
 channels:
+  - pytorch
   - conda-forge
 dependencies:
   - python>=3.10
@@ -28,6 +30,8 @@ dependencies:
   - pyyaml>=6.0
   - typer>=0.12
   - rich>=13.0
+  - pytorch>=2.0
+  - cpuonly
   - pip
   - pip:
       - rcsb-api>=1.7
