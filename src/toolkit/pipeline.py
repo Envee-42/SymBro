@@ -183,9 +183,19 @@ def run_query(
     from toolkit import query as _query
 
     criteria = _build_criteria(symmetry, entry_id, resolution_range, description, extra_criteria)
+    # "symmetry" (RCSB's OWN annotated rcsb_struct_symmetry.symbol) is
+    # always fetched, whether or not the caller asked for it or searched
+    # by it: run_geometry()'s annotated-symmetry cross-check (see
+    # _drop_symmetry_mismatches() below) needs it on every candidate to
+    # have anything to compare its own empirical ring detection against
+    # -- making this opt-in via --fetch-field would silently disable that
+    # safety check for anyone who didn't think to ask for it.
+    all_fetch_fields = list(fetch_fields) if fetch_fields else []
+    if "symmetry" not in all_fetch_fields:
+        all_fetch_fields.append("symmetry")
     df = _query.query_candidates(
         search_criteria=criteria,
-        fetch_fields=list(fetch_fields) if fetch_fields else None,
+        fetch_fields=all_fetch_fields,
         filter_criteria=list(filter_criteria) if filter_criteria else None,
         mode=match,
         return_type=return_type,
@@ -266,10 +276,108 @@ def run_local(
 # Stage 3: geometry (rings, always; orientation + termini SS, if symmetry_type given)
 # ----------------------------------------------------------------------
 
+_CYCLIC_SYMBOL_RE = re.compile(r"^C(\d+)$")
+
+
+def _expected_cyclic_orders(annotated_symmetry, allowed_orders: Sequence[int]) -> list:
+    """
+    Parses an RCSB rcsb_struct_symmetry.symbol value (e.g. "C3", or
+    "C3, C2" -- query.extract_leaf_values' comma-join of a multi-component
+    assembly's several symmetry records) into the cyclic orders symbro's
+    own ring detector could, in principle, confirm or refute.
+
+    Anything outside that scope -- dihedral "D*", Platonic "T"/"O"/"I",
+    helical "H", asymmetric "C1", an order outside allowed_orders (e.g.
+    "C6"), or a missing/NaN value -- is simply dropped from the result,
+    not guessed at: this project's own detector (geometry/rings.py) only
+    ever reasons about head-to-tail cyclic sub-rings, so asserting which
+    of those a Dn/T/O/I point group "should" decompose into would be
+    claiming structural-biology knowledge this project doesn't otherwise
+    have. Returns [] if nothing in the annotation is in scope.
+    """
+    if annotated_symmetry is None or (isinstance(annotated_symmetry, float) and pd.isna(annotated_symmetry)):
+        return []
+    allowed = set(allowed_orders)
+    orders = []
+    for token in str(annotated_symmetry).split(","):
+        match = _CYCLIC_SYMBOL_RE.match(token.strip())
+        if match and int(match.group(1)) in allowed:
+            orders.append(int(match.group(1)))
+    return orders
+
+
+def _drop_symmetry_mismatches(
+    rings_df: pd.DataFrame, downloaded_df: pd.DataFrame, allowed_orders: Sequence[int],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cross-checks each assembly's empirically detected rings (rings_df --
+    pure structural analysis, no RCSB involved) against RCSB's OWN
+    annotated symmetry (downloaded_df's "symmetry" column,
+    rcsb_struct_symmetry.symbol -- always fetched by run_query(), see its
+    own comment). Real PDB depositions occasionally have this wrong (the
+    wrong assembly definition marked biological, a crystallographic
+    packing mate mistaken for a real ring, etc.) -- an assembly that
+    fails this check is a strong candidate for exactly that kind of
+    annotation issue, not a design worth spending RFdiffusion/ProteinMPNN
+    compute chasing.
+
+    Only assemblies whose annotation includes at least one in-scope
+    cyclic order (see _expected_cyclic_orders) are checked at all --
+    dihedral/Platonic/other annotations, or a missing "symmetry" column
+    entirely (e.g. `symbro local` candidates, never looked up against
+    RCSB), are left untouched.
+
+    An assembly is dropped -- every one of its rows, across every
+    detected symmetry_type/component -- only if NONE of its expected
+    cyclic orders were found anywhere in rings_df for that assembly_id.
+    Finding even one (e.g. RCSB says "C3, C2" and only the C3 ring was
+    confirmed) is enough to keep it.
+
+    Returns (kept_df, dropped_df). dropped_df has one row per dropped
+    assembly_id: assembly_id, expected (e.g. "C3", or "C2, C3" if more
+    than one order was annotated), detected (comma-joined symmetry_types
+    rings_df DID find for that assembly, or "none"). Empty (but
+    correctly-columned) if nothing was dropped, or if there was nothing
+    in scope to check.
+    """
+    empty_dropped = pd.DataFrame(columns=["assembly_id", "expected", "detected"])
+    if rings_df.empty or downloaded_df is None or "symmetry" not in downloaded_df.columns \
+            or "assembly_id" not in downloaded_df.columns:
+        return rings_df, empty_dropped
+
+    annotated = downloaded_df.drop_duplicates(subset="assembly_id", keep="first") \
+        .set_index("assembly_id")["symmetry"]
+    detected_by_assembly = rings_df.groupby("assembly_id")["symmetry_type"].apply(set)
+
+    assemblies_to_drop = set()
+    dropped_rows = []
+    for assembly_id, annotated_symmetry in annotated.items():
+        expected_orders = _expected_cyclic_orders(annotated_symmetry, allowed_orders)
+        if not expected_orders:
+            continue  # nothing in scope for this assembly -- leave it alone
+        expected_types = {f"C{n}" for n in expected_orders}
+        detected_types = detected_by_assembly.get(assembly_id, set())
+        if expected_types & detected_types:
+            continue  # at least one expected ring was actually confirmed
+        assemblies_to_drop.add(assembly_id)
+        dropped_rows.append({
+            "assembly_id": assembly_id,
+            "expected": ", ".join(sorted(expected_types)),
+            "detected": ", ".join(sorted(detected_types)) if detected_types else "none",
+        })
+
+    if not assemblies_to_drop:
+        return rings_df, empty_dropped
+
+    kept_df = rings_df[~rings_df["assembly_id"].isin(assemblies_to_drop)].reset_index(drop=True)
+    return kept_df, pd.DataFrame(dropped_rows, columns=["assembly_id", "expected", "detected"])
+
+
 def run_geometry(
     downloaded_df: Optional[pd.DataFrame] = None,
     symmetry_type: Optional[str] = None,
     state_dir: str = DEFAULT_STATE_DIR,
+    validate_annotated_symmetry: bool = True,
 ) -> pd.DataFrame:
     """
     Detects symmetry rings in every downloaded structure. If symmetry_type
@@ -283,6 +391,17 @@ def run_geometry(
     committing to one) and the returned DataFrame carries every order
     found, unmerged.
 
+    validate_annotated_symmetry : if True (default), cross-checks every
+        assembly's detected rings against RCSB's own annotated symmetry
+        (see _drop_symmetry_mismatches()) and drops any assembly whose
+        detection found none of its expected cyclic orders -- almost
+        always a sign of a PDB annotation issue (wrong assembly marked
+        biological, etc.) rather than a real candidate worth pursuing.
+        A warning naming each dropped assembly, what was expected, and
+        what was actually detected is printed either way. Pass False to
+        keep every detected ring regardless of what RCSB annotated --
+        e.g. if you're deliberately investigating a mismatch yourself.
+
     If downloaded_df isn't given, loads it from
     <state_dir>/downloaded.pkl. Saves the result to
     <state_dir>/geometry.{pkl,csv} and returns it.
@@ -295,6 +414,17 @@ def run_geometry(
         downloaded_df = load_checkpoint(DOWNLOADED_STAGE, state_dir, needed_by="Geometry analysis")
 
     rings_df = _rings.from_structure(downloaded_df)
+
+    if validate_annotated_symmetry and not rings_df.empty:
+        rings_df, dropped_df = _drop_symmetry_mismatches(rings_df, downloaded_df, _rings.ALLOWED_ORDERS)
+        for _, row in dropped_df.iterrows():
+            print(
+                f"Warning: {row['assembly_id']} dropped -- RCSB annotates it as "
+                f"{row['expected']} symmetry, but symbro's own geometry detection "
+                f"found {row['detected']} instead (likely a PDB annotation issue, "
+                f"not a real candidate). Re-run with validate_annotated_symmetry=False "
+                f"(--no-validate-symmetry on the CLI) to keep it anyway."
+            )
 
     if symmetry_type is None or rings_df.empty:
         save_checkpoint(rings_df, GEOMETRY_STAGE, state_dir)

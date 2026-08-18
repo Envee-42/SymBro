@@ -5,6 +5,25 @@ All notable changes to SymBro are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Annotated-symmetry cross-check** (`symbro geometry`, on by default):
+  cross-checks each assembly's empirically detected rings against RCSB's
+  own annotated symmetry (`rcsb_struct_symmetry.symbol`, now always
+  fetched by `symbro query`) and drops any assembly where none of its
+  annotated cyclic orders (`C2`-`C5`) were actually confirmed by
+  detection -- a real, if uncommon, sign of a PDB annotation issue (wrong
+  assembly marked biological, a crystallographic packing mate mistaken
+  for the real ring, etc.) rather than a genuine candidate worth pursuing
+  compute on. A warning naming the assembly, what was expected, and what
+  was actually detected is always printed. Dihedral/Platonic/helical/
+  asymmetric annotations, and `symbro local` candidates (never looked up
+  against RCSB), are left unvalidated -- out of scope for what symbro's
+  own cyclic-ring detector can confirm or refute. Pass
+  `--no-validate-symmetry` to keep every detected ring regardless.
+
 ## [1.0.0] - 2026-08-18
 
 First stable release. SymBro now covers the full symmetry-broken protein

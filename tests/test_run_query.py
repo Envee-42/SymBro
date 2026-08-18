@@ -119,3 +119,32 @@ def test_symbro_query_filter_flag_bad_syntax_names_the_right_flag(project_dir):
     assert result.exit_code == 1
     assert "--filter" in result.output
     assert "--criterion" not in result.output
+
+
+# ----------------------------------------------------------------------
+# pipeline.run_query() -- "symmetry" is always fetched (see run_query()'s
+# own comment: run_geometry()'s annotated-symmetry cross-check needs it
+# on every candidate, whether or not the caller searched by it or asked
+# for it via --fetch-field).
+# ----------------------------------------------------------------------
+def test_run_query_always_fetches_symmetry_even_when_not_requested(monkeypatch, project_dir):
+    calls = []
+    monkeypatch.setattr(query, "query_candidates", _fake_query_candidates(calls))
+
+    # Search by entry_id only -- "symmetry" is neither a search criterion
+    # nor an explicit fetch_field here.
+    pipeline.run_query(entry_id=["4HHB"], state_dir=".symbro")
+
+    assert len(calls) == 1
+    assert "symmetry" in calls[0]["fetch_fields"]
+
+
+def test_run_query_does_not_duplicate_symmetry_when_already_requested(monkeypatch, project_dir):
+    calls = []
+    monkeypatch.setattr(query, "query_candidates", _fake_query_candidates(calls))
+
+    pipeline.run_query(entry_id=["4HHB"], fetch_fields=["symmetry", "weight"], state_dir=".symbro")
+
+    assert len(calls) == 1
+    assert calls[0]["fetch_fields"].count("symmetry") == 1
+    assert "weight" in calls[0]["fetch_fields"]

@@ -15,7 +15,7 @@ Given a symmetry type you're interested in (e.g. C3, meaning three identical cop
 | 1 | `symbro query` | Search RCSB PDB for candidate assemblies matching your criteria (symmetry, resolution, keywords, ...) |
 | 2 | `symbro download` | Download the matching structure files |
 | — | `symbro local` | *Alternative* to `query`+`download`: register your own local PDB/CIF file(s) instead of searching RCSB |
-| 3 | `symbro geometry` | Detect symmetry rings in each structure (and orientation/termini secondary structure, for one chosen symmetry order) |
+| 3 | `symbro geometry` | Detect symmetry rings in each structure (and orientation/termini secondary structure, for one chosen symmetry order). Also cross-checks each assembly against RCSB's own annotated symmetry and drops any that don't match (`--no-validate-symmetry` to disable — see below) |
 | 4 | `symbro isolate` | Extract each ring's own structure file, ready for RFdiffusion |
 | 5 | `symbro rfdiffusion` | Submit RFdiffusion (an AI model that generates new protein backbone shapes) — one job per assembly — locally, via Singularity, or to a SLURM cluster |
 | — | `symbro status` | Check on `--detach`'d RFdiffusion jobs |
@@ -110,6 +110,14 @@ Then edit it — at minimum, `repo_path`/`python_executable` (or the equivalent 
 **AF3 without the hundreds-of-GB database:** `af3.db_dir` is only required if you actually want AF3 to search real genetic/template databases for MSA hits — set `af3.run_data_pipeline: false` instead (or pass `--af3-no-data-pipeline`) and this backend needs nothing beyond `model_dir`, the same setup cost as Boltz/AlphaFold2. Confirmed directly against AF3's own source and docs, not assumed: `db_dir` is never read when the data pipeline is off, and every candidate is folded using AF3's own documented MSA/template-free mode (query sequence only) rather than left in an undefined in-between state. This is a genuine prediction-quality tradeoff, not just a setup shortcut — ProteinMPNN-designed sequences are often novel enough that a real search adds little, but it's still an explicit choice, not symbro's default.
 
 Nothing here is required to get started — every setting can also be passed directly as a CLI flag, and `symbro query`/`download`/`geometry`/`isolate` don't need any of this at all.
+
+### Annotated-symmetry cross-check
+
+PDB depositions occasionally get their symmetry annotation wrong (a crystallographic packing mate mistaken for the real biological assembly, the wrong assembly definition marked primary, etc.) — the coordinates are fine, but the metadata isn't. By default, `symbro geometry` cross-checks each assembly's own empirically detected rings against RCSB's *own* annotated symmetry (`rcsb_struct_symmetry.symbol`, fetched automatically by `symbro query` whether or not you asked for it) and drops any assembly where none of its annotated cyclic orders were actually confirmed by detection — printing a warning naming the assembly, what was expected, and what was actually found, so you're never left wondering why a candidate silently disappeared.
+
+This only ever applies to *cyclic* annotations symbro can reason about directly (`C2`–`C5` — the orders its own ring detector looks for); dihedral, Platonic (`D*`, `T`, `O`, `I`), helical, or asymmetric (`C1`) annotations are left untouched, since asserting which cyclic sub-rings those "should" decompose into isn't something this project claims to know. `symbro local` candidates (never looked up against RCSB) are unaffected too — there's no annotation to check them against.
+
+Pass `--no-validate-symmetry` to keep every detected ring regardless of what RCSB annotated — e.g. if you're deliberately investigating a mismatch yourself rather than treating it as disqualifying.
 
 ## Quickstart
 

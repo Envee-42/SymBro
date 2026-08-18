@@ -313,10 +313,22 @@ def geometry(
              "termini secondary structure. Omit on a first pass to just see what's "
              "present in your candidates before choosing one.",
     ),
+    validate_symmetry: bool = typer.Option(
+        True, "--validate-symmetry/--no-validate-symmetry",
+        help="Drop assemblies whose detected rings don't include any of RCSB's own "
+             "annotated symmetry (a real, if uncommon, sign of a PDB annotation issue "
+             "-- wrong assembly marked biological, etc.) rather than passing them "
+             "through as candidates. You'll be warned either way. Pass "
+             "--no-validate-symmetry to keep every detected ring regardless of what "
+             "RCSB annotated -- e.g. if you're deliberately investigating a mismatch.",
+    ),
 ):
     """Detect symmetry rings in every downloaded structure."""
     try:
-        df = pipeline.run_geometry(symmetry_type=symmetry_type, state_dir=ctx.obj["state_dir"])
+        df = pipeline.run_geometry(
+            symmetry_type=symmetry_type, state_dir=ctx.obj["state_dir"],
+            validate_annotated_symmetry=validate_symmetry,
+        )
     except pipeline.StageNotFoundError as exc:
         _fail(str(exc))
     except typer.Exit:
