@@ -15,7 +15,7 @@ Given a symmetry type you're interested in (e.g. C3, meaning three identical cop
 | 1 | `symbro query` | Search RCSB PDB for candidate assemblies matching your criteria (symmetry, resolution, keywords, ...) |
 | 2 | `symbro download` | Download the matching structure files |
 | — | `symbro local` | *Alternative* to `query`+`download`: register your own local PDB/CIF file(s) instead of searching RCSB |
-| 3 | `symbro geometry` | Detect symmetry rings in each structure (and orientation/termini secondary structure, for one chosen symmetry order). Also cross-checks each assembly against RCSB's own annotated symmetry and drops any that don't match (`--no-validate-symmetry` to disable — see below) |
+| 3 | `symbro geometry` | Detect symmetry rings in each structure (and orientation/termini secondary structure, for one chosen symmetry order). Also cross-checks each assembly against RCSB's own annotated symmetry and drops any that don't match (`--no-validate-symmetry` to disable — see below), and warns (never drops) on any surviving ring that didn't claim every eligible chain (`--no-warn-incomplete-axes` to disable — see below) |
 | 4 | `symbro isolate` | Extract each ring's own structure file, ready for RFdiffusion |
 | 5 | `symbro rfdiffusion` | Submit RFdiffusion (an AI model that generates new protein backbone shapes) — one job per assembly — locally, via Singularity, or to a SLURM cluster |
 | — | `symbro status` | Check on `--detach`'d RFdiffusion jobs |
@@ -118,6 +118,12 @@ PDB depositions occasionally get their symmetry annotation wrong (a crystallogra
 This applies to plain cyclic annotations (`C2`–`C5` — the orders its own ring detector looks for) directly, and to Platonic annotations (`T`, `O`, `I`) by checking for their own known constituent cyclic axes — `T` (tetrahedral) → C3 or C2, `O` (octahedral) → C4, C3, or C2, `I` (icosahedral) → C5, C3, or C2, finding any one of which is enough to keep the assembly. This project's own target assemblies are Platonic by nature (that's exactly what `symbro isolate` extracts a cyclic sub-ring from), so this decomposition isn't a guess — it's what the rest of the pipeline already assumes. Dihedral (`D*`), helical (`H`), and asymmetric (`C1`) annotations are still left untouched, since this project doesn't otherwise claim to know how those decompose. `symbro local` candidates (never looked up against RCSB) are unaffected too — there's no annotation to check them against.
 
 Pass `--no-validate-symmetry` to keep every detected ring regardless of what RCSB annotated — e.g. if you're deliberately investigating a mismatch yourself rather than treating it as disqualifying.
+
+### Incomplete-ring warning
+
+A separate, independent check: even when the annotated axis *type* is correctly confirmed, not every eligible chain in a component necessarily ends up claimed by a detected ring. By default, `symbro geometry` also compares each surviving row's `axis_count` against the most disjoint rings that component's own chain count could possibly support (`component_chain_count // order` — e.g. 24 usable chains toward a C3 ring can support at most 8 disjoint triplets) and prints a warning for any row that falls short, naming how many rings were found versus how many were possible.
+
+This is *not* an annotation problem — the axis type itself is genuinely present — so, unlike the cross-check above, a shortfall here never drops the assembly. It most often reflects real, chain-specific structural disorder in that particular deposition (a partially unmodeled loop, local flexibility that breaks the geometric register for just those chains), which is worth knowing about before committing RFdiffusion/ProteinMPNN compute to a candidate, but isn't on its own a reason to discard it. Pass `--no-warn-incomplete-axes` to skip this check.
 
 ## Quickstart
 

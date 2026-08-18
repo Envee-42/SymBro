@@ -399,11 +399,73 @@ def _drop_symmetry_mismatches(
     return kept_df, pd.DataFrame(dropped_rows, columns=["assembly_id", "expected", "detected"])
 
 
+def _warn_incomplete_axis_counts(rings_df: pd.DataFrame) -> None:
+    """
+    Prints a warning for every row whose axis_count falls short of the
+    most disjoint groupings this component's OWN chain count could
+    possibly support (component_chain_count // order) — e.g. a C3
+    component with 24 usable chains can support at most 8 disjoint C3
+    triplets; a row reporting axis_count=6 leaves 6 of those 24 chains
+    unclaimed by any accepted ring.
+
+    This is a DIFFERENT signal from _drop_symmetry_mismatches() above.
+    That function asks "was the expected axis TYPE found at all" (an
+    RCSB-annotation cross-check) and drops an assembly when the answer is
+    no. This function asks "of the chains that COULD form this type of
+    ring, how many actually did" — a purely internal completeness check
+    that doesn't reference RCSB's annotation at all, and can flag a row
+    even when the annotation is entirely correct and the axis type is
+    genuinely, correctly present.
+
+    A shortfall here is deliberately only ever a warning, never a drop:
+    unlike a missing axis type, an incomplete count isn't itself evidence
+    the whole candidate is unusable. Chains fail to join a detectable
+    ring for real, unremarkable structural reasons that have nothing to
+    do with the deposition's annotation being wrong — most commonly local
+    disorder or a partially unmodeled loop specific to those particular
+    chains in THIS deposited structure (see rings.py's contact-check
+    docstring for why a genuinely non-adjacent chain is correctly
+    rejected rather than force-fit into a ring it doesn't structurally
+    belong to). Collapsing "some chains in this assembly didn't form a
+    detectable ring" into "drop the whole assembly" would treat every
+    such case as a PDB annotation problem, which it usually isn't — so
+    this is surfaced for you to judge chain-by-chain instead, the same as
+    any other caveat this pipeline reports without acting on unilaterally.
+
+    No-op (prints nothing) if rings_df is empty or predates the
+    component_chain_count column (an older checkpoint from before this
+    check existed).
+    """
+    if rings_df.empty or "component_chain_count" not in rings_df.columns:
+        return
+
+    for _, row in rings_df.iterrows():
+        match = _CYCLIC_SYMBOL_RE.match(str(row["symmetry_type"]))
+        total_chains = row.get("component_chain_count")
+        if not match or pd.isna(total_chains):
+            continue
+        order = int(match.group(1))
+        expected_max = int(total_chains) // order
+        if expected_max <= 0 or row["axis_count"] >= expected_max:
+            continue
+        component_id = row.get("component_id")
+        component_note = f", component {component_id}" if pd.notna(component_id) else ""
+        print(
+            f"Warning: {row['assembly_id']}{component_note} found only {row['axis_count']}/{expected_max} "
+            f"possible disjoint {row['symmetry_type']} rings ({int(total_chains)} usable chains could "
+            f"support up to {expected_max}). The axis type itself is confirmed -- this isn't an annotation "
+            f"issue -- but not every chain in this component formed a detectable ring, which can reflect "
+            f"real structural disorder specific to this deposition. Not dropped -- worth checking which "
+            f"chains were left unclaimed before committing compute to this candidate."
+        )
+
+
 def run_geometry(
     downloaded_df: Optional[pd.DataFrame] = None,
     symmetry_type: Optional[str] = None,
     state_dir: str = DEFAULT_STATE_DIR,
     validate_annotated_symmetry: bool = True,
+    warn_incomplete_axes: bool = True,
 ) -> pd.DataFrame:
     """
     Detects symmetry rings in every downloaded structure. If symmetry_type
@@ -428,6 +490,16 @@ def run_geometry(
         keep every detected ring regardless of what RCSB annotated --
         e.g. if you're deliberately investigating a mismatch yourself.
 
+    warn_incomplete_axes : if True (default), separately flags -- but
+        never drops -- any surviving row whose axis_count falls short of
+        the most disjoint groupings its own component_chain_count could
+        support (see _warn_incomplete_axis_counts()). This is independent
+        of validate_annotated_symmetry: it doesn't reference RCSB's
+        annotation at all, so it can fire even for a row whose annotated
+        type IS confirmed -- e.g. a Platonic assembly with a correctly
+        detected C3 ring that nonetheless didn't claim every eligible
+        chain. Pass False to skip this check entirely.
+
     If downloaded_df isn't given, loads it from
     <state_dir>/downloaded.pkl. Saves the result to
     <state_dir>/geometry.{pkl,csv} and returns it.
@@ -451,6 +523,9 @@ def run_geometry(
                 f"not a real candidate). Re-run with validate_annotated_symmetry=False "
                 f"(--no-validate-symmetry on the CLI) to keep it anyway."
             )
+
+    if warn_incomplete_axes and not rings_df.empty:
+        _warn_incomplete_axis_counts(rings_df)
 
     if symmetry_type is None or rings_df.empty:
         save_checkpoint(rings_df, GEOMETRY_STAGE, state_dir)

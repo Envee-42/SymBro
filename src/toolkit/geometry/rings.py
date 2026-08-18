@@ -108,7 +108,7 @@ DEFAULT_LINKER_BUFFER: int = 2          # extra residues added at both ends for 
 _OUTPUT_COLUMNS: Tuple[str, ...] = (
     "assembly_id", "symmetry_type", "component_id", "chain_groups",
     "mean_distance", "std_distance", "recommended_linker_length", "junctions",
-    "axis_count", "equivalent_groups",
+    "axis_count", "equivalent_groups", "component_chain_count",
 )
 
 
@@ -457,10 +457,18 @@ def detect_symmetry_rings(
       ((min_residues, max_residues), from estimate_linker_length() on
       mean_distance), junctions (list of (from_chain, to_chain,
       distance) for that grouping), axis_count (how many disjoint
-      groupings of this order were found for THIS component), and
+      groupings of this order were found for THIS component),
       equivalent_groups (every other accepted grouping's chain-ID tuple
       for this SAME component — empty if chain_groups was the only one
-      found for it; never another component's rings).
+      found for it; never another component's rings), and
+      component_chain_count (how many chains this identity cluster had
+      usable geometry for in THIS structure — i.e. the size `usable`
+      below, before any grouping/exclusivity logic runs at all. Lets a
+      caller compute the maximum number of disjoint groupings of this
+      order this component's own chain count could possibly support
+      (component_chain_count // order) and compare it against axis_count
+      to flag a component that's short some chains from a full ring
+      decomposition — see pipeline.py's _warn_incomplete_axis_counts()).
 
     Empty (but correctly-columned) if nothing survives detection for any
     requested order.
@@ -510,6 +518,7 @@ def detect_symmetry_rings(
                 "junctions": main["junctions"],
                 "axis_count": len(accepted),
                 "equivalent_groups": [c["chains"] for c in accepted[1:]],
+                "component_chain_count": len(usable),
             })
 
     return pd.DataFrame(rows, columns=list(_OUTPUT_COLUMNS))

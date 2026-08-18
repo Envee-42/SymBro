@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   candidates (never looked up against RCSB), are left unvalidated.
   Pass `--no-validate-symmetry` to keep every detected ring regardless.
 
+- **Incomplete-ring warning** (`symbro geometry`, on by default): flags
+  -- but never drops -- any surviving row whose `axis_count` falls short
+  of the most disjoint rings its own component chain count could
+  possibly support (a new `component_chain_count` column on `rings.py`'s
+  output, `// order` gives the theoretical max). Independent of the
+  annotation cross-check above: it fires even when the expected axis
+  type is correctly confirmed, since it's checking whether every
+  eligible chain formed a detectable ring, not whether the right type of
+  ring exists at all. A shortfall is deliberately warn-only, not
+  dropped -- it usually reflects real, chain-specific structural
+  disorder in that particular deposition rather than an annotation
+  problem, and collapsing that into an automatic drop would be too
+  aggressive a call to make without a human looking at which chains were
+  left unclaimed. Pass `--no-warn-incomplete-axes` to skip it.
+
 ## [1.0.0] - 2026-08-18
 
 First stable release. SymBro now covers the full symmetry-broken protein

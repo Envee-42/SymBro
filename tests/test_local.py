@@ -139,7 +139,7 @@ def test_run_local_output_flows_through_geometry(project_dir):
     assert list(rings.columns) == [
         "assembly_id", "symmetry_type", "component_id", "chain_groups",
         "mean_distance", "std_distance", "recommended_linker_length",
-        "junctions", "axis_count", "equivalent_groups",
+        "junctions", "axis_count", "equivalent_groups", "component_chain_count",
     ]
 
 

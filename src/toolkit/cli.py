@@ -322,12 +322,22 @@ def geometry(
              "--no-validate-symmetry to keep every detected ring regardless of what "
              "RCSB annotated -- e.g. if you're deliberately investigating a mismatch.",
     ),
+    warn_incomplete_axes: bool = typer.Option(
+        True, "--warn-incomplete-axes/--no-warn-incomplete-axes",
+        help="Warn (never drop) about a surviving row whose axis_count falls short of "
+             "the most disjoint rings its own chain count could support -- e.g. only 6 "
+             "of 8 possible C3 triplets found. Independent of --validate-symmetry: the "
+             "axis type itself may be entirely correctly detected, this just flags that "
+             "not every eligible chain formed a ring, often real per-structure disorder "
+             "rather than an annotation problem. Pass --no-warn-incomplete-axes to skip.",
+    ),
 ):
     """Detect symmetry rings in every downloaded structure."""
     try:
         df = pipeline.run_geometry(
             symmetry_type=symmetry_type, state_dir=ctx.obj["state_dir"],
             validate_annotated_symmetry=validate_symmetry,
+            warn_incomplete_axes=warn_incomplete_axes,
         )
     except pipeline.StageNotFoundError as exc:
         _fail(str(exc))

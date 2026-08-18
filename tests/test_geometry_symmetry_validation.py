@@ -53,12 +53,18 @@ def test_expected_cyclic_orders(annotated, expected):
 # _drop_symmetry_mismatches -- pure DataFrame-level unit tests
 # ----------------------------------------------------------------------
 
-def _rings_row(assembly_id, symmetry_type, component_id=0):
-    return {
+def _rings_row(assembly_id, symmetry_type, component_id=0, axis_count=1, component_chain_count=None):
+    row = {
         "assembly_id": assembly_id, "symmetry_type": symmetry_type, "component_id": component_id,
         "chain_groups": ("A", "B"), "mean_distance": 5.0, "std_distance": 0.1,
-        "recommended_linker_length": (3, 6), "junctions": [], "axis_count": 1, "equivalent_groups": [],
+        "recommended_linker_length": (3, 6), "junctions": [], "axis_count": axis_count, "equivalent_groups": [],
     }
+    # Only set when a test cares about it -- omitting it entirely (the
+    # default) matches an older rings_df predating this column, exercised
+    # by test_warn_incomplete_axis_counts_missing_column_is_a_no_op below.
+    if component_chain_count is not None:
+        row["component_chain_count"] = component_chain_count
+    return row
 
 
 def test_drop_symmetry_mismatches_confirmed_match_is_kept():
@@ -161,6 +167,67 @@ def test_drop_symmetry_mismatches_empty_rings_df_is_a_no_op():
 
 
 # ----------------------------------------------------------------------
+# _warn_incomplete_axis_counts -- pure DataFrame-level unit tests. This is
+# a DIFFERENT check from _drop_symmetry_mismatches above: it never
+# references RCSB's annotation, only compares axis_count against what
+# component_chain_count // order says was possible -- and it only ever
+# prints, it never drops anything (see its own docstring for why).
+# ----------------------------------------------------------------------
+
+def test_warn_incomplete_axis_counts_warns_when_short(capsys):
+    # 9 usable chains could support at most 3 disjoint C3 triplets --
+    # only 2 were actually found, so 3 chains went unclaimed.
+    rings_df = pd.DataFrame([_rings_row("A1", "C3", axis_count=2, component_chain_count=9)])
+    pipeline._warn_incomplete_axis_counts(rings_df)
+    captured = capsys.readouterr()
+    assert "A1" in captured.out
+    assert "2/3" in captured.out
+    assert "C3" in captured.out
+
+
+def test_warn_incomplete_axis_counts_silent_when_complete(capsys):
+    # axis_count already equals the stoichiometric maximum -- nothing to flag.
+    rings_df = pd.DataFrame([_rings_row("A1", "C3", axis_count=3, component_chain_count=9)])
+    pipeline._warn_incomplete_axis_counts(rings_df)
+    assert capsys.readouterr().out == ""
+
+
+def test_warn_incomplete_axis_counts_never_drops_rows():
+    # However short the count, this function only ever prints -- the
+    # DataFrame itself (and therefore what run_geometry() returns/saves)
+    # is never touched.
+    rings_df = pd.DataFrame([_rings_row("A1", "C3", axis_count=1, component_chain_count=9)])
+    pipeline._warn_incomplete_axis_counts(rings_df)
+    assert len(rings_df) == 1
+
+
+def test_warn_incomplete_axis_counts_missing_column_is_a_no_op(capsys):
+    # An older rings_df from before component_chain_count existed.
+    rings_df = pd.DataFrame([_rings_row("A1", "C3", axis_count=1)])
+    assert "component_chain_count" not in rings_df.columns
+    pipeline._warn_incomplete_axis_counts(rings_df)
+    assert capsys.readouterr().out == ""
+
+
+def test_warn_incomplete_axis_counts_empty_df_is_a_no_op(capsys):
+    rings_df = pd.DataFrame(columns=["assembly_id", "symmetry_type", "axis_count", "component_chain_count"])
+    pipeline._warn_incomplete_axis_counts(rings_df)
+    assert capsys.readouterr().out == ""
+
+
+def test_warn_incomplete_axis_counts_multiple_short_rows_each_warn(capsys):
+    rings_df = pd.DataFrame([
+        _rings_row("A1", "C3", component_id=0, axis_count=5, component_chain_count=24),
+        _rings_row("A1", "C3", component_id=1, axis_count=6, component_chain_count=24),
+    ])
+    pipeline._warn_incomplete_axis_counts(rings_df)
+    captured = capsys.readouterr()
+    assert captured.out.count("A1") == 2
+    assert "5/8" in captured.out
+    assert "6/8" in captured.out
+
+
+# ----------------------------------------------------------------------
 # run_geometry() end to end -- ring DETECTION itself is exercised for
 # real elsewhere; here _rings.from_structure is monkeypatched at exactly
 # that boundary (same principle as test_cli_integration.py's
@@ -228,6 +295,40 @@ def test_run_geometry_no_symmetry_column_behaves_as_before(project_dir, ring_pdb
     assert set(df["symmetry_type"]) == {"C2"}
 
 
+def _install_fake_incomplete_c3_detection(monkeypatch, assembly_id="TEST-1"):
+    # 8 usable chains could support 2 disjoint C3 triplets -- only 1 found.
+    fake_rings_df = pd.DataFrame([_rings_row(assembly_id, "C3", axis_count=1, component_chain_count=8)])
+
+    def _fake_from_structure(df, **kwargs):
+        return fake_rings_df.copy()
+
+    monkeypatch.setattr(_rings, "from_structure", _fake_from_structure)
+
+
+def test_run_geometry_warns_on_incomplete_axis_count_but_keeps_row(project_dir, ring_pdb, monkeypatch, capsys):
+    _install_fake_incomplete_c3_detection(monkeypatch)
+    df = pipeline.run_geometry(
+        downloaded_df=_downloaded_df(ring_pdb, symmetry="C3"), state_dir=".symbro",
+    )
+    # Never dropped -- axis type IS confirmed, only the count is short.
+    assert not df.empty
+    assert set(df["symmetry_type"]) == {"C3"}
+    captured = capsys.readouterr()
+    assert "TEST-1" in captured.out
+    assert "1/2" in captured.out
+
+
+def test_run_geometry_no_warn_incomplete_axes_suppresses_it(project_dir, ring_pdb, monkeypatch, capsys):
+    _install_fake_incomplete_c3_detection(monkeypatch)
+    df = pipeline.run_geometry(
+        downloaded_df=_downloaded_df(ring_pdb, symmetry="C3"), state_dir=".symbro",
+        warn_incomplete_axes=False,
+    )
+    assert not df.empty
+    captured = capsys.readouterr()
+    assert "1/2" not in captured.out
+
+
 # ----------------------------------------------------------------------
 # CLI layer -- flag threading and printed warning
 # ----------------------------------------------------------------------
@@ -253,3 +354,25 @@ def test_cli_geometry_no_validate_symmetry_flag_keeps_mismatch(project_dir, ring
     assert result.exit_code == 0, result.output
     assert "Symmetry types detected" in result.output
     assert "C2" in result.output
+
+
+def test_cli_geometry_warns_on_incomplete_axis_count_by_default(project_dir, ring_pdb, monkeypatch):
+    _install_fake_incomplete_c3_detection(monkeypatch)
+    os.makedirs(".symbro", exist_ok=True)
+    _downloaded_df(ring_pdb, symmetry="C3").to_pickle(os.path.join(".symbro", "downloaded.pkl"))
+
+    result = runner.invoke(app, ["geometry"])
+    assert result.exit_code == 0, result.output
+    assert "TEST-1" in result.output
+    assert "1/2" in result.output
+    assert "Symmetry types detected" in result.output  # not dropped
+
+
+def test_cli_geometry_no_warn_incomplete_axes_flag_suppresses_it(project_dir, ring_pdb, monkeypatch):
+    _install_fake_incomplete_c3_detection(monkeypatch)
+    os.makedirs(".symbro", exist_ok=True)
+    _downloaded_df(ring_pdb, symmetry="C3").to_pickle(os.path.join(".symbro", "downloaded.pkl"))
+
+    result = runner.invoke(app, ["geometry", "--no-warn-incomplete-axes"])
+    assert result.exit_code == 0, result.output
+    assert "1/2" not in result.output
