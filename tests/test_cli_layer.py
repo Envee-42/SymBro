@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 from toolkit import pipeline, pmpnn, rfdiffusion
 from toolkit.cli import app
 from conftest import rings_df
-from test_cli_integration import install_rfdiffusion_fakes, install_pmpnn_fakes
+from tests.test_cli_integration import install_rfdiffusion_fakes, install_pmpnn_fakes
 
 runner = CliRunner()
 

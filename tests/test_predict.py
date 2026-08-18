@@ -25,7 +25,7 @@ import pytest
 
 from toolkit import pipeline, structure_prediction
 from conftest import rings_df
-from test_cli_integration import install_rfdiffusion_fakes, install_pmpnn_fakes, _completed_rfdiffusion_df
+from tests.test_cli_integration import install_rfdiffusion_fakes, install_pmpnn_fakes, _completed_rfdiffusion_df
 
 
 def install_predict_fake(monkeypatch, calls, winners_factory=None):

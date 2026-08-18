@@ -22,7 +22,7 @@ from typer.testing import CliRunner
 
 from toolkit import pipeline
 from toolkit.cli import app
-from test_query import _install_rcsbapi_stub
+from tests.test_query import _install_rcsbapi_stub
 
 _install_rcsbapi_stub()
 from toolkit import query  # noqa: E402 -- must come after the stub install above
