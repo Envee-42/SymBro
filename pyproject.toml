@@ -24,6 +24,15 @@ dependencies = [
     "torch>=2.0",
 ]
 
+[project.optional-dependencies]
+# `symbro codon` (toolkit/codon.py) -- pure-Python, no GPU/CUDA/external
+# repo clone involved (unlike RFdiffusion/ProteinMPNN/the
+# structure-prediction backends, which stay fully external either way),
+# but it's still only needed by the last pipeline stage, so it's an
+# extra rather than a base dependency the way torch is above:
+#   pip install symbro[codon]
+codon = ["dnachisel>=3.2", "python_codon_tables>=0.1.18"]
+
 # torch is a base dependency (not an optional extra) because most symbro
 # users run ProteinMPNN -- see pmpnn.py's own module docstring: it only
 # needs plain torch (confirmed against dauparas/ProteinMPNN's own source:

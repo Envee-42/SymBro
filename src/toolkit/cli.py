@@ -9,6 +9,8 @@ Typical workflow, run in order:
 
     symbro query         search RCSB PDB for candidate assemblies
     symbro download      download the matching structure files
+    symbro local         (ALTERNATIVE to query+download) register your own
+                         local PDB/CIF file(s) instead of searching RCSB
     symbro geometry      detect symmetry rings (and orientation/termini for one type)
     symbro isolate       extract each ring's PDB, ready for RFdiffusion
     symbro rfdiffusion   submit RFdiffusion, one job per assembly (blocks until done
@@ -16,6 +18,8 @@ Typical workflow, run in order:
     symbro status        check on --detach'd RFdiffusion jobs
     symbro pmpnn         run ProteinMPNN against each assembly's best design(s)
     symbro predict       fold candidates back (boltz/af2/af3) and screen by self-consistency
+    symbro codon         reverse-translate validated designs into host-codon-optimized DNA
+                         (needs the "codon" extra: pip install symbro\[codon])
     symbro clean         clear scratch files + checkpoints between runs
 
 Each command picks up automatically where the previous one left off (via
@@ -30,6 +34,7 @@ from typing import List, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from toolkit import pipeline
@@ -82,7 +87,15 @@ def main(
 
 
 def _fail(message: str) -> "typer.NoReturn":
-    err_console.print(f"[bold red]✗[/bold red] {message}")
+    # rich_markup_mode="rich" (see the Typer() constructor above) means
+    # console.print() interprets "[...]" in ITS OWN format string as
+    # markup tags -- an exception message that happens to contain a
+    # literal "[...]" (e.g. codon.py's own "pip install symbro[codon]")
+    # would otherwise get silently swallowed as an unrecognized tag
+    # rather than printed. rich.markup.escape() keeps `message` itself
+    # untouched (str(exc) elsewhere, e.g. in tests, still sees the real
+    # text) and only escapes it at this print boundary.
+    err_console.print(f"[bold red]✗[/bold red] {escape(message)}")
     raise typer.Exit(code=1)
 
 
@@ -248,6 +261,43 @@ def download(
         _fail(f"Download failed: {exc}")
 
     console.print(f"[bold green]✓[/bold green] Downloaded {len(df)} structure(s).")
+    _summarize(df, empty_hint="")
+    if not df.empty:
+        console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/downloaded.pkl[/cyan] (preview: downloaded.csv)")
+        console.print("  Next: [bold]symbro geometry --symmetry-type <e.g. C3>[/bold]")
+
+
+@app.command()
+def local(
+    ctx: typer.Context,
+    paths: List[str] = typer.Argument(
+        ..., help="Local PDB/CIF file path(s) to register as candidates (repeatable)."
+    ),
+    assembly_id: Optional[List[str]] = typer.Option(
+        None, "--assembly-id",
+        help="Label for each path, same order and count as PATHS (repeatable). "
+             "Default: derived from each file's own name.",
+    ),
+    data_dir: Optional[str] = typer.Option(
+        None, help="Where to copy registered files (default: temporary_files/local/)."
+    ),
+    overwrite: bool = typer.Option(False, help="Re-copy files that already exist at the destination."),
+):
+    """Register your own local PDB/CIF file(s) as candidates -- an alternative to
+    `symbro query` + `symbro download` for a structure you already have."""
+    try:
+        df = pipeline.run_local(
+            paths, assembly_ids=assembly_id or None, data_dir=data_dir, overwrite=overwrite,
+            state_dir=ctx.obj["state_dir"],
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        _fail(str(exc))
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"Registering local structure(s) failed: {exc}")
+
+    console.print(f"[bold green]✓[/bold green] Registered {len(df)} local structure(s).")
     _summarize(df, empty_hint="")
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/downloaded.pkl[/cyan] (preview: downloaded.csv)")
@@ -567,6 +617,75 @@ def predict(
                                "or loosen those thresholds.")
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/predict.pkl[/cyan] (preview: predict.csv)")
+
+
+@app.command()
+def codon(
+    ctx: typer.Context,
+    host: str = typer.Option(
+        "e_coli", help="Codon usage table to optimize for -- one of e_coli, s_cerevisiae, h_sapiens, "
+                        "c_elegans, b_subtilis, d_melanogaster, g_gallus, m_musculus "
+                        "(python_codon_tables' own bundled organisms)."
+    ),
+    assembly_id: Optional[str] = typer.Option(None, help="Only optimize this assembly (default: every row in predict.pkl)."),
+    method: str = typer.Option(
+        "use_best_codon", help="DNAChisel codon-optimization method: use_best_codon (CAI-style, most "
+                                "frequent codon every time), match_codon_usage (matches the host's overall "
+                                "codon usage profile), or harmonize_rca (rarely applicable here -- see "
+                                "codon.py's own module docstring)."
+    ),
+    gc_min: float = typer.Option(0.3, help="Minimum GC content fraction (0-1), checked overall and per --gc-window."),
+    gc_max: float = typer.Option(0.65, help="Maximum GC content fraction (0-1), checked overall and per --gc-window."),
+    gc_window: int = typer.Option(100, help="Window size (nt) for the local GC content check."),
+    homopolymer_max: int = typer.Option(5, help="Longest allowed run of one nucleotide (0 disables this check)."),
+    avoid_hairpins: bool = typer.Option(True, "--avoid-hairpins/--allow-hairpins", help="Avoid self-complementary hairpin regions."),
+    avoid_repeats_kmer: int = typer.Option(15, help="Disallow any repeated subsequence of this length (0 disables this check)."),
+    avoid_enzyme: List[str] = typer.Option(
+        ["BsaI", "BsmBI"], "--avoid-enzyme",
+        help="Restriction site(s) to keep out of the sequence (repeatable; DNAChisel enzyme names, e.g. "
+             "EcoRI). Defaults to the two Type IIS Golden Gate enzymes prosculpt's own codon step avoids "
+             "-- pass this flag with no values to disable."
+    ),
+    add_stop_codon: bool = typer.Option(
+        True, "--add-stop-codon/--no-stop-codon",
+        help="Append the host's own preferred stop codon. Use --no-stop-codon if this sequence is meant "
+             "to be fused into a larger ORF (e.g. behind an N-terminal tag)."
+    ),
+    fasta_path: Optional[str] = typer.Option(
+        None, "--fasta", help="Where to write the orderable FASTA (default: <state-dir>/codon.fasta)."
+    ),
+):
+    """
+    Reverse-translate symbro predict's validated designs into host-codon-optimized DNA (needs the
+    "codon" extra: pip install symbro\[codon]), applying standard gene-synthesis safety checks (GC
+    content, homopolymer runs, hairpins, repeats, common Golden Gate enzyme sites). Produces a strong
+    starting sequence per candidate -- still meant to be reviewed by hand before ordering, not a fully
+    automated expression-vector assembly. See codon.py's own module docstring for the full scope.
+    """
+    try:
+        df = pipeline.run_codon(
+            assembly_id=assembly_id, host=host, method=method, gc_min=gc_min, gc_max=gc_max,
+            gc_window=gc_window, homopolymer_max=homopolymer_max, avoid_hairpins=avoid_hairpins,
+            avoid_repeats_kmer=avoid_repeats_kmer or None, avoid_enzymes=avoid_enzyme or None,
+            add_stop_codon=add_stop_codon, fasta_path=fasta_path, state_dir=ctx.obj["state_dir"],
+        )
+    except pipeline.StageNotFoundError as exc:
+        _fail(str(exc))
+    except ImportError as exc:
+        _fail(str(exc))
+    except (ValueError, RuntimeError) as exc:
+        _fail(f"Codon optimization failed: {exc}")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"Codon optimization failed: {exc}")
+
+    console.print(f"[bold green]✓[/bold green] {len(df)} sequence(s) codon-optimized for {host!r}.")
+    _summarize(df, empty_hint="No candidate could be optimized -- check the messages printed above "
+                               "(likely a predict.pkl/pmpnn.pkl checkpoint mismatch).")
+    if not df.empty:
+        console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/codon.pkl[/cyan] (preview: codon.csv), "
+                       f"FASTA: [cyan]{fasta_path or os.path.join(ctx.obj['state_dir'], 'codon.fasta')}[/cyan]")
 
 
 @app.command()

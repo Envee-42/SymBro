@@ -32,6 +32,7 @@ function, or --state-dir on the CLI). Each stage writes TWO files:
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional, Sequence, Tuple, Union
 
 import pandas as pd
@@ -54,6 +55,7 @@ ISOLATE_STAGE = "rings"
 RFDIFFUSION_STAGE = "rfdiffusion"
 PMPNN_STAGE = "pmpnn"
 PREDICT_STAGE = "predict"
+CODON_STAGE = "codon"
 
 # poll_status() states that mean "this job is done, one way or another" --
 # shared by both the RFdiffusion and ProteinMPNN polling loops below.
@@ -214,6 +216,48 @@ def run_download(
     if candidates_df is None:
         candidates_df = load_checkpoint(CANDIDATES_STAGE, state_dir, needed_by="Downloading structures")
     df = _download.download_candidates(candidates_df, data_dir=data_dir, overwrite=overwrite)
+    save_checkpoint(df, DOWNLOADED_STAGE, state_dir)
+    return df
+
+
+# ----------------------------------------------------------------------
+# Stage 2 (alternative): local -- register your own structure file(s)
+# instead of query + download
+# ----------------------------------------------------------------------
+
+def run_local(
+    paths: Sequence[str],
+    assembly_ids: Optional[Sequence[str]] = None,
+    data_dir: Optional[str] = None,
+    overwrite: bool = False,
+    state_dir: str = DEFAULT_STATE_DIR,
+) -> pd.DataFrame:
+    """
+    Registers your own local PDB/CIF file(s) as candidates -- an
+    alternative to run_query() + run_download() for a structure you
+    already have, rather than one you want RCSB to find for you.
+
+    Writes to the SAME checkpoint run_download() does
+    (<state_dir>/downloaded.{pkl,csv}) -- every stage from run_geometry()
+    onward can't tell the difference and needs no changes to work with a
+    locally-sourced structure. Calling this after `symbro query` (or
+    `symbro download`) in the same project overwrites that checkpoint,
+    same as re-running `symbro download` itself would -- run_local() and
+    run_query()+run_download() are alternatives, not additive; mixing
+    RCSB-sourced and local candidates in one project isn't supported
+    today (call this once with every local path you want registered, in
+    one go).
+
+    See local.py's own module docstring for why files are copied into
+    temporary_files/local/ rather than referenced in place, and what
+    happens if no assembly_ids are given.
+    """
+    from toolkit import local as _local
+
+    df = _local.register_local_structures(
+        list(paths), assembly_ids=list(assembly_ids) if assembly_ids else None,
+        data_dir=data_dir, overwrite=overwrite,
+    )
     save_checkpoint(df, DOWNLOADED_STAGE, state_dir)
     return df
 
@@ -907,13 +951,170 @@ def run_predict(
     return df
 
 
+def _component_key(df: pd.DataFrame) -> pd.Series:
+    """A NaN-safe merge key for a component_id column -- component_id is
+    None for a single-component assembly, and plain == / a plain merge on
+    a float NaN column doesn't reliably match None to None (this is the
+    exact join bug run_predict() itself needed a fix for once already --
+    see test_predict.py). Shared here so it isn't reinvented per caller.
+
+    Always stringifies the non-null case too (not just the "__none__"
+    sentinel) -- if one side of a merge happens to be a subset with no
+    NaN component_id at all (e.g. join_predict_with_pmpnn() called after
+    narrowing predict_df to a single multi-component assembly), leaving
+    non-null values as raw floats produces a plain float64 key column on
+    that side but an object-dtype column (mixed "__none__" strings and
+    floats) on the other, un-narrowed side -- pandas' merge() refuses to
+    join float64 against object outright, confirmed by hitting exactly
+    this with `symbro codon --assembly-id`'s own narrowing. Stringifying
+    unconditionally keeps both sides' dtype identical regardless of
+    whether either one happens to contain a NaN in a given call."""
+    return df["component_id"].apply(lambda v: "__none__" if pd.isna(v) else str(v))
+
+
+def join_predict_with_pmpnn(predict_df: pd.DataFrame, pmpnn_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    predict.pkl (see _PREDICT_COLUMNS) doesn't carry the amino acid
+    sequence that produced each validated candidate -- only
+    candidate_id/folded_path/rmsd_to_design/mean_plddt. The sequence
+    itself lives in pmpnn.pkl, keyed differently: candidate_id is
+    sanitize_id(f"{source_pdb}_rank{rank}") (see selfconsistency.py's own
+    sanitize_id()/build_reference_map()), where rank is assigned fresh
+    every time run_predict() calls pmpnn.select_best_designs() -- sort
+    each (assembly_id, component_id, source_pdb) group by global_score
+    ascending (excluding the native-sequence readback row), rank starting
+    at 1 -- and is never itself stored in pmpnn.pkl. This re-derives that
+    same rank/candidate_id here to join the two checkpoints back together
+    (used by run_codon() below, and by examples/04_analysis_notebook's
+    own join, kept in sync with this rather than reimplemented there).
+
+    Returns predict_df with sequence/score/global_score/seq_recovery
+    columns added from the matching pmpnn_df row (NaN in those columns,
+    not a raised error, if a row's originating pmpnn_df entry can't be
+    found -- e.g. mismatched checkpoints from different runs).
+    """
+    non_native = pmpnn_df[~pmpnn_df["is_native"]].copy()
+    non_native["rank"] = (
+        non_native.sort_values("global_score")
+        .groupby(["assembly_id", "component_id", "source_pdb"], dropna=False, sort=False)
+        .cumcount() + 1
+    )
+    non_native["candidate_id"] = [
+        re.sub(r"[^A-Za-z0-9_-]", "_", f"{src}_rank{rank}")
+        for src, rank in zip(non_native["source_pdb"], non_native["rank"])
+    ]
+    non_native["_component_key"] = _component_key(non_native)
+
+    result = predict_df.copy()
+    result["_component_key"] = _component_key(result)
+    result = result.merge(
+        non_native[["assembly_id", "_component_key", "candidate_id", "sequence", "score",
+                     "global_score", "seq_recovery"]],
+        on=["assembly_id", "_component_key", "candidate_id"], how="left",
+    )
+    return result.drop(columns="_component_key")
+
+
+# ----------------------------------------------------------------------
+# Stage 8: codon optimization (reverse-translate validated designs into
+# synthesis-ready DNA -- always local, pure computation, no external tool
+# or GPU involved)
+# ----------------------------------------------------------------------
+
+_CODON_COLUMNS: Tuple[str, ...] = (
+    "assembly_id", "component_id", "candidate_id", "host", "protein_sequence",
+    "dna_sequence", "gc_content", "warnings",
+)
+
+
+def run_codon(
+    predict_df: Optional[pd.DataFrame] = None,
+    pmpnn_df: Optional[pd.DataFrame] = None,
+    assembly_id: Optional[str] = None,
+    host: Optional[str] = None,
+    method: str = "use_best_codon",
+    gc_min: float = 0.3,
+    gc_max: float = 0.65,
+    gc_window: int = 100,
+    homopolymer_max: int = 5,
+    avoid_hairpins: bool = True,
+    avoid_repeats_kmer: Optional[int] = 15,
+    avoid_enzymes: Optional[Sequence[str]] = None,
+    add_stop_codon: bool = True,
+    fasta_path: Optional[str] = None,
+    state_dir: str = DEFAULT_STATE_DIR,
+) -> pd.DataFrame:
+    """
+    Reverse-translates every validated candidate in predict.pkl into
+    host-codon-optimized DNA (toolkit.codon, built on DNAChisel +
+    python_codon_tables -- needs the "codon" extra: `pip install
+    symbro[codon]`), applying the standard gene-synthesis safety
+    constraints described in codon.py's own module docstring (GC content
+    window, homopolymer runs, hairpins, repeated k-mers, common Golden
+    Gate enzyme sites). See that docstring for exactly what this is and
+    isn't meant to replace -- short version: a strong, safe-by-default
+    starting sequence per candidate, meant to still be manually reviewed
+    before ordering, not a fully automated expression-vector assembly.
+
+    predict_df doesn't carry the amino acid sequence itself (see
+    _PREDICT_COLUMNS) -- join_predict_with_pmpnn() recovers it from
+    pmpnn_df first. If predict_df/pmpnn_df aren't given, loads them from
+    <state_dir>/predict.pkl and <state_dir>/pmpnn.pkl.
+
+    Saves the result to <state_dir>/codon.{pkl,csv} AND an orderable
+    FASTA (default <state_dir>/codon.fasta, override with fasta_path=)
+    with one record per successfully optimized candidate. Returns the
+    same DataFrame that was saved.
+
+    A candidate is skipped (reported, not fatal to the rest of the
+    batch -- same fail-soft convention as run_pmpnn()/run_predict()) if
+    its sequence couldn't be recovered from pmpnn_df (checkpoint
+    mismatch) or if DNAChisel couldn't produce a valid sequence for it.
+    """
+    from toolkit import codon as _codon
+
+    if predict_df is None:
+        predict_df = load_checkpoint(PREDICT_STAGE, state_dir, needed_by="Codon optimization")
+    if pmpnn_df is None:
+        pmpnn_df = load_checkpoint(PMPNN_STAGE, state_dir, needed_by="Codon optimization")
+    if predict_df.empty:
+        raise ValueError(
+            "predict.pkl has no validated candidates to codon-optimize -- check `symbro predict`'s "
+            "own output, or loosen its --max-rmsd/--min-plddt and rerun it."
+        )
+
+    subset = predict_df
+    if assembly_id is not None:
+        subset = subset[subset["assembly_id"] == assembly_id]
+        if subset.empty:
+            raise ValueError(f"No row for assembly_id={assembly_id!r} in the predict checkpoint.")
+
+    joined = join_predict_with_pmpnn(subset, pmpnn_df)
+    df = _codon.optimize_candidates(
+        joined, host=host or _codon.DEFAULT_HOST, method=method, gc_min=gc_min, gc_max=gc_max,
+        gc_window=gc_window, homopolymer_max=homopolymer_max, avoid_hairpins=avoid_hairpins,
+        avoid_repeats_kmer=avoid_repeats_kmer,
+        avoid_enzymes=avoid_enzymes if avoid_enzymes is not None else _codon.DEFAULT_ENZYMES_AVOIDED,
+        add_stop_codon=add_stop_codon,
+    )
+    save_checkpoint(df, CODON_STAGE, state_dir)
+
+    if fasta_path is None:
+        fasta_path = os.path.join(state_dir, "codon.fasta")
+    if not df.empty:
+        _codon.write_fasta(df, fasta_path)
+        print(f"Wrote orderable FASTA ({len(df)} record(s)) to {fasta_path}")
+
+    return df
+
+
 # ----------------------------------------------------------------------
 # Cleanup — the "start fresh" button, between pipeline runs
 # ----------------------------------------------------------------------
 
 _ALL_STAGES: Tuple[str, ...] = (
     CANDIDATES_STAGE, DOWNLOADED_STAGE, GEOMETRY_STAGE, ISOLATE_STAGE, RFDIFFUSION_STAGE, PMPNN_STAGE,
-    PREDICT_STAGE,
+    PREDICT_STAGE, CODON_STAGE,
 )
 
 
@@ -928,8 +1129,12 @@ def clean(
 
       state        : every <stage>.pkl/.csv checkpoint under state_dir
                      (candidates, downloaded, geometry, rings,
-                     rfdiffusion, pmpnn) -- state_dir itself is left in
-                     place, only the checkpoint files inside it go.
+                     rfdiffusion, pmpnn, predict, codon), plus codon's own
+                     extra codon.fasta (not a checkpoint file itself, but
+                     exactly the kind of stale reference back to a
+                     just-cleared run this same warning is about below)
+                     -- state_dir itself is left in place, only the files
+                     inside it go.
       downloads    : contents of temporary_files/ (download.py's own
                      clear_temp_dir()).
       subunits     : contents of temporary_subunits/ (isolate.py's own
@@ -978,6 +1183,18 @@ def clean(
                     for p in existing:
                         os.remove(p)
                 cleared["state"].append(stage)
+
+        # codon.fasta isn't a <stage>.pkl/.csv pair -- save_checkpoint() never
+        # wrote it, run_codon() did, alongside codon.pkl/.csv -- but leaving
+        # it behind after codon's own checkpoint is cleared is exactly the
+        # stale-reference situation this function's own docstring warns
+        # about, so it's cleared here too.
+        fasta_path = os.path.join(state_dir, "codon.fasta")
+        if os.path.exists(fasta_path):
+            if not dry_run:
+                os.remove(fasta_path)
+            if CODON_STAGE not in cleared["state"]:
+                cleared["state"].append(CODON_STAGE)
 
     def _has_content(dir_path: str) -> bool:
         return any(not entry.startswith(".") for entry in os.listdir(dir_path))

@@ -1,6 +1,6 @@
 # symbro
 
-A CLI/pipeline for symmetry-broken protein cage design: RCSB query → download → geometry analysis → isolate ring subunits → RFdiffusion → ProteinMPNN → structure-prediction screening → validated designs.
+A CLI/pipeline for symmetry-broken protein cage design: RCSB query → download → geometry analysis → isolate ring subunits → RFdiffusion → ProteinMPNN → structure-prediction screening → validated designs → (optionally) codon-optimized DNA, ready to order.
 
 **New to this?** In plain terms: symbro helps you take a symmetric protein assembly — a "cage" made of several identical copies of a chain arranged around an axis or a point — and redesign one repeating "wedge" of it into something new, using AI protein-design tools, while checking computationally that the redesign is likely to actually fold correctly before you'd ever synthesize it in a lab. That starting assembly doesn't have to be naturally occurring: RCSB (the archive symbro searches) holds both naturally-evolved structures (e.g. a virus shell or an enzyme ring) and previously engineered/de novo-designed ones (e.g. a published synthetic nanocage) side by side, and symbro works with either kind the same way. You don't need to be a programmer to use it: each step below is one typed command, and symbro tells you what to run next after every one.
 
@@ -14,12 +14,14 @@ Given a symmetry type you're interested in (e.g. C3, meaning three identical cop
 |---|---|---|
 | 1 | `symbro query` | Search RCSB PDB for candidate assemblies matching your criteria (symmetry, resolution, keywords, ...) |
 | 2 | `symbro download` | Download the matching structure files |
+| — | `symbro local` | *Alternative* to `query`+`download`: register your own local PDB/CIF file(s) instead of searching RCSB |
 | 3 | `symbro geometry` | Detect symmetry rings in each structure (and orientation/termini secondary structure, for one chosen symmetry order) |
 | 4 | `symbro isolate` | Extract each ring's own structure file, ready for RFdiffusion |
 | 5 | `symbro rfdiffusion` | Submit RFdiffusion (an AI model that generates new protein backbone shapes) — one job per assembly — locally, via Singularity, or to a SLURM cluster |
 | — | `symbro status` | Check on `--detach`'d RFdiffusion jobs |
 | 6 | `symbro pmpnn` | Run ProteinMPNN (an AI model that fills in an amino-acid sequence for a given backbone shape) against each assembly's best RFdiffusion design(s) |
 | 7 | `symbro predict` | Fold ProteinMPNN's best candidate sequence(s) back into a 3D structure (via AlphaFold2, Boltz, or AlphaFold3) and screen them by self-consistency — i.e., check the refolded shape actually matches what RFdiffusion originally designed, before you trust the sequence |
+| 8 | `symbro codon` | *Optional.* Reverse-translate `predict`'s validated designs into host-codon-optimized DNA, ready to order (needs the `codon` extra: `pip install symbro[codon]`) |
 | — | `symbro clean` | Clear scratch files and checkpoints between runs |
 
 Every stage before `symbro rfdiffusion` runs on your own machine with no special hardware. `symbro rfdiffusion`, `symbro pmpnn`, and `symbro predict` are the compute-heavy AI steps — a GPU (graphics card capable of accelerating deep learning) makes these dramatically faster, and is required for most real-world-sized jobs. Each of these three offers `backend: "local"` (run right here, as a plain subprocess), `"singularity"` (a container image), or `"slurm"` (submit to an HPC cluster) — configured per-tool in `installation.yaml` (see **Configuration** below).
@@ -51,6 +53,17 @@ Run `symbro --help` or `symbro <command> --help` at any time for the full option
 
 If you're not sure which one you need, start with `--criterion` — `symbro query --help` explains the difference and lists example operators (`range`, `contains_phrase`, etc.).
 
+### Using your own structure instead of RCSB
+
+Already have the PDB/CIF file you want to work with — your own prior design, something not (yet) in RCSB, or just a structure you'd rather not re-download? `symbro local` registers it directly, skipping `symbro query`/`symbro download` entirely:
+
+```bash
+symbro local my_cage.pdb
+symbro local ring_a.pdb ring_b.pdb --assembly-id my-cage-A --assembly-id my-cage-B
+```
+
+It writes to the exact same checkpoint `symbro download` does, so every stage from `symbro geometry` onward treats a locally-registered structure identically to one fetched from RCSB — no separate code path, no missing features. Each file is copied into `temporary_files/local/` (covered by `symbro clean`'s existing `--keep-downloads` flag, same as a real download). This is an alternative to `symbro query`+`symbro download`, not something you combine with them in the same project — running `symbro local` after `symbro download` (or vice versa) overwrites whichever `downloaded.pkl` ran last, the same way re-running `symbro download` itself would.
+
 ## Installation
 
 Requires Python 3.10+.
@@ -76,6 +89,14 @@ conda activate symbro
 
 RFdiffusion, ProteinMPNN itself (the `protein_mpnn_run.py` script and model weights), and the structure-prediction backends (AlphaFold2/Boltz/AlphaFold3) are still **not** installed by this package — their own installs are heavy (RFdiffusion in particular needs a CUDA-pinned environment), and most of what symbro does (query/download/geometry/isolate) never touches them. `pip install -e .` only gets you the Python library ProteinMPNN needs (PyTorch) — you still need your own clone of ProteinMPNN itself. Install and point symbro at your own copies of each as you need them — see **Configuration** below.
 
+`symbro codon` (reverse-translating validated designs into orderable DNA — see **Quickstart**'s optional last step) needs its own small extra, since it's pure Python with no GPU/external repo involved but still only used by that one, optional final stage:
+
+```bash
+pip install -e ".[codon]"
+```
+
+No `installation.yaml` setup needed for it — unlike the AI stages, it's a plain pip dependency.
+
 ## Configuration
 
 Machine-specific settings (where your RFdiffusion/ProteinMPNN/structure-prediction (AlphaFold2/Boltz/AlphaFold3) clones live, which Python environment to use, which execution backend) live in one gitignored file, `installation.yaml`, in your project root:
@@ -85,6 +106,8 @@ cp installation.example.yaml installation.yaml
 ```
 
 Then edit it — at minimum, `repo_path`/`python_executable` (or the equivalent executable path) for whichever tools you're using. See `installation.example.yaml` for the full field-by-field reference, including SLURM-specific settings (`partition`, `time`, `gres`/`gpus`, `setup_lines` for conda/module activation, etc.) if you're submitting to an HPC cluster. Note that AlphaFold3's model weights specifically carry a non-commercial license and must be requested directly from Google — symbro never fetches or bundles them; see `af3.py`'s own module docstring and the `af3:` section of `installation.example.yaml` before using that backend.
+
+**AF3 without the hundreds-of-GB database:** `af3.db_dir` is only required if you actually want AF3 to search real genetic/template databases for MSA hits — set `af3.run_data_pipeline: false` instead (or pass `--af3-no-data-pipeline`) and this backend needs nothing beyond `model_dir`, the same setup cost as Boltz/AlphaFold2. Confirmed directly against AF3's own source and docs, not assumed: `db_dir` is never read when the data pipeline is off, and every candidate is folded using AF3's own documented MSA/template-free mode (query sequence only) rather than left in an undefined in-between state. This is a genuine prediction-quality tradeoff, not just a setup shortcut — ProteinMPNN-designed sequences are often novel enough that a real search adds little, but it's still an explicit choice, not symbro's default.
 
 Nothing here is required to get started — every setting can also be passed directly as a CLI flag, and `symbro query`/`download`/`geometry`/`isolate` don't need any of this at all.
 
@@ -115,15 +138,23 @@ symbro pmpnn
 #    (picks a predictor from installation.yaml by default; override with --predictor)
 symbro predict
 
+# 8. Optional: reverse-translate the validated designs into orderable DNA
+#    (needs the "codon" extra: pip install symbro[codon])
+symbro codon --host e_coli
+
 # Start fresh between runs
 symbro clean
 ```
 
 Every command prints where its output was saved (a `.pkl` checkpoint plus a human-readable `.csv` preview) and what to run next. The designs left in `predict.csv` after step 7 — the ones that passed the RMSD/pLDDT self-consistency thresholds — are your validated output.
 
+**Analyzing your results:** [`examples/04_analysis_notebook`](examples/04_analysis_notebook/) has a local Jupyter notebook (no GPU needed, just `symbro` itself installed) that reads `predict.pkl` straight off disk and gives you a self-consistency RMSD-vs-pLDDT scatter, a per-assembly/symmetry-type breakdown, an adjustable shortlist, and a structure preview — a much better lens on the same numbers than eyeballing `predict.csv`.
+
+**Codon-optimizing for gene synthesis:** step 8 above reverse-translates each validated design into DNA, codon-optimized for a host of your choice (`--host e_coli` by default; also `s_cerevisiae`, `h_sapiens`, `c_elegans`, `b_subtilis`, `d_melanogaster`, `g_gallus`, `m_musculus`), applying the standard safety checks a synthesis vendor would otherwise flag: GC content kept within a safe range both overall and in local windows, no long homopolymer runs, no problematic hairpins or repeated subsequences, and the two most common Type IIS Golden Gate cloning sites (BsaI/BsmBI) kept out of the sequence by default. It saves `.symbro/codon.{pkl,csv}` plus an orderable `.symbro/codon.fasta`. This gets you a strong starting sequence per design, not a fully automated expression-vector assembly — every sequence is still meant to be reviewed by hand before you actually order it. See `codon.py`'s own module docstring for the full scope and reasoning, including how this compares to the Baker-lab Domesticator3 tool prosculpt's own equivalent step wraps.
+
 ## Project status
 
-Query, download, geometry, isolate, RFdiffusion, ProteinMPNN, and structure-prediction screening (`symbro predict`, across all three backends — AlphaFold2, Boltz, and AlphaFold3) are all wired up end-to-end and covered by the automated test suite described below. Real-world validation of each structure-prediction backend against a live HPC cluster run is ongoing — if you hit a rough edge specifically in `symbro predict` on your own cluster, that's the newest and least battle-tested part of the pipeline, so it's the most likely place for one.
+Query, download, local structure registration, geometry, isolate, RFdiffusion, ProteinMPNN, structure-prediction screening (`symbro predict`, across all three backends — AlphaFold2, Boltz, and AlphaFold3), and codon optimization (`symbro codon`) are all wired up end-to-end and covered by the automated test suite described below. Real-world validation of each structure-prediction backend against a live HPC cluster run is ongoing — if you hit a rough edge specifically in `symbro predict` on your own cluster, that's the newest and least battle-tested part of the pipeline, so it's the most likely place for one. `symbro codon`'s own DNA-optimization logic is fully tested against real DNAChisel runs; what isn't independently verified is a synthesis vendor's actual acceptance of its output, since that needs a real order to confirm.
 
 ## Testing
 

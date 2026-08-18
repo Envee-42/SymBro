@@ -1,0 +1,143 @@
+MINIMAL SCRIPTS — READ THIS FIRST
+==================================
+
+This folder is not a tutorial (see /examples for that, with real captured
+output). It's the thing to keep open in a terminal tab while you're
+actually running your own project: a launch script you copy and edit
+three lines in, plus the gotchas below that aren't obvious from --help
+text alone. Written the way you'd explain it to a labmate, not a manual.
+
+WHAT YOU NEED BEFORE STARTING
+------------------------------
+Nothing local, necessarily -- symbro normally starts from RCSB (`symbro
+query` searches, `symbro download` fetches). But if you already have the
+PDB/CIF file you want to work with -- your own prior design, something
+not (yet) in RCSB, whatever -- use `symbro local` instead of query+
+download:
+
+    symbro local my_cage.pdb
+
+It writes to the exact same checkpoint `symbro download` does, so
+`symbro geometry` onward can't tell the difference. See the main
+README's "Using your own structure instead of RCSB" section for the
+full rundown (multiple files, custom --assembly-id labels, etc.).
+
+COPY launch.sh (OR launch.ps1 ON WINDOWS), EDIT THE TOP, RUN IT
+------------------------------------------------------------------
+Both scripts have an "EDIT THIS" block at the top: your own --symmetry/
+--resolution-max/--entry-id criteria. Copy the whole minimal_scripts/
+folder into a new empty directory per project (same idea as prosculpt's
+own launch.sh convention -- some people keep a separate copy per
+project). It runs query -> download -> geometry (broad pass) and then
+STOPS -- on purpose, see below.
+
+WHY IT STOPS AFTER THE BROAD geometry PASS
+---------------------------------------------
+symbro's whole design is "small resumable steps you inspect between,"
+not "one big automated run" -- every stage's own --help text says as
+much. The broad `symbro geometry` pass (no --symmetry-type) is cheap and
+tells you what's actually present before you commit to one. Look at its
+output, then run:
+
+    symbro geometry --symmetry-type <whichever one you want>
+    symbro isolate
+    symbro rfdiffusion
+    symbro pmpnn
+    symbro predict
+
+yourself, one at a time, per the main README's Quickstart or
+/examples/01_full_walkthrough. Trying to script all of that blind
+defeats the point of the checkpoint design.
+
+ALWAYS RUN symbro FROM YOUR PROJECT ROOT
+-------------------------------------------
+Every path (.symbro/, temporary_files/, temporary_subunits/,
+temporary_simulations/) resolves relative to wherever you ARE when you
+type `symbro`, not to some fixed project setting. `cd`ing somewhere else
+partway through -- even just to poke at an output file -- and then
+running the next command from there will look like it's starting a new,
+empty project. symbro prints "Working from: <path>" at the top of every
+command specifically so you can catch this before it confuses you.
+
+--criterion VS --filter (people mix these up)
+------------------------------------------------
+--criterion is sent to RCSB's own search -- fast, but only works for
+fields RCSB's Search API actually supports.
+--filter is applied locally, AFTER results come back -- slower (you're
+downloading metadata for things that might get filtered out after), but
+it's the only option for fetch-only fields (model_quality is the
+current example) that have no Search API equivalent at all.
+If you don't know which one you need: start with --criterion, and only
+reach for --filter if `symbro query --help` tells you the field you want
+doesn't support it.
+
+One more subtlety: --match (and/or) applies separately to --criterion
+and --filter, not jointly across both. "or" on your --criterion list
+does NOT mean your --filter list also gets OR'd in against everything
+else.
+
+RUN geometry WITHOUT --symmetry-type FIRST
+-----------------------------------------------
+Don't guess. The broad pass is cheap (no orientation/termini computed)
+and shows you every symmetry type actually present in what you
+downloaded. THEN narrow with --symmetry-type.
+
+components > assemblies MEANS A MULTI-PROTEIN CAGE
+--------------------------------------------------------
+If `symbro geometry`'s summary shows components > assemblies for some
+symmetry type, that means at least one assembly is built from more than
+one structurally distinct protein at that symmetry order (a two-protein
+cage, most commonly). `symbro isolate` extracts one ring file PER
+COMPONENT by default -- use --component-id to work on just one.
+
+Also: the exact chain letters symbro picks to represent a ring (e.g.
+"A-5, A-9" vs "A-12, A-2, A-7" for the literal same structure on a
+different run) are a symmetry-mate SELECTION, not a fixed canonical
+label -- they can differ between reruns of the same geometry/isolate
+call. Refer to component_id in your own notes, not a specific chain
+label, if you need to talk about "the same ring" across reruns.
+
+RUNNING pmpnn AGAINST MORE THAN ONE ASSEMBLY IN A ROW
+----------------------------------------------------------
+`symbro pmpnn` stages its ProteinMPNN input PDBs in a folder that gets
+overwritten at the START of the next run against the same out_folder --
+it does NOT keep history of every past run. If you're screening more
+than one assembly before moving on to `symbro predict` (or writing your
+own script against the checkpoint, the way run_predictor.py does), pass
+--assembly-id/--component-id explicitly each time rather than assuming
+the staged files still match whichever assembly you ran last.
+
+symbro clean --keep-state
+------------------------------
+Clears scratch files but leaves the .symbro/ checkpoints in place. Only
+reach for this if you specifically know why -- the default (clear
+everything together) exists because a checkpoint pointing at a file that
+scratch-clearing just deleted is a worse state to be in than starting
+fresh. `--dry-run` shows you what would get cleared without touching
+anything, if you just want to check first.
+
+IF YOU'RE ON WINDOWS (this dev checkout is)
+-------------------------------------------------------
+query/download/geometry/isolate/pmpnn all run natively, no GPU needed.
+RFdiffusion does NOT run natively on Windows -- it needs WSL2, a
+Singularity/cluster backend, or Colab (see the main README's OS
+compatibility table and toolkit/symbro_rfdiffusion_colab.ipynb). Boltz
+runs natively (CPU); AF2/AF3 don't, for the same JAX/Linux-only reasons
+as RFdiffusion. Plan your backend before you get to stage 5, not after.
+
+AF3 SPECIFICALLY
+---------------------
+Needs model weights you request directly from Google (non-commercial
+license, symbro never bundles them) AND, unless you pass
+--af3-no-data-pipeline, a real genetic-database directory that's
+hundreds of GB. Read af3.py's own module docstring and the af3: section
+of installation.example.yaml before picking it as your default
+predictor -- boltz has none of these requirements and is the easiest
+first backend to actually get running.
+
+--detach ONLY DOES ANYTHING ON backend: slurm
+---------------------------------------------------
+`symbro rfdiffusion --detach` on a local/singularity backend won't
+error, but there's nothing to detach FROM -- you're still going to wait
+for the job to finish either way. See /examples/03_slurm_detach_workflow
+if you're actually on a SLURM cluster.

@@ -65,11 +65,34 @@ before looking for output.
 
 INFRASTRUCTURE, honestly flagged: unlike ColabFold/Boltz (which default
 to a free hosted MSA search API), AF3's own data pipeline needs a large
-local genetic-database download (hundreds of GB) unless you disable it
-(run_data_pipeline=False) and supply pre-computed MSAs some other way —
-this project doesn't build that "bring your own MSA" path today, so a
-real "local"/"singularity" run needs db_dir set up in full. This is a
-materially heavier local install than either other backend.
+local genetic-database download (hundreds of GB) if you want it to
+actually search for real MSA/template hits. Since ProteinMPNN-designed
+sequences are typically novel enough that a real search often turns up
+few or no genuine homologs anyway, and MSA/template search is the single
+heaviest setup cost of using AF3 at all, run_data_pipeline=False here
+does NOT require db_dir to be set up, or even to exist — confirmed
+directly against google-deepmind/alphafold3's own run_alphafold.py: its
+db_dir-path validation (replace_db_dir()) only ever executes inside the
+`if _RUN_DATA_PIPELINE.value:` branch, so db_dir is never read, checked,
+or needed when the pipeline is off. This module additionally writes each
+candidate's JSON with unpairedMsa/pairedMsa set to "" and templates set
+to [] whenever run_data_pipeline=False — AF3's own documented mechanism
+(docs/input.md) for "run completely MSA/template-free, model input is
+just the query sequence" — rather than leaving those fields unset, which
+docs/input.md instead documents as "build both automatically" (i.e. the
+OPPOSITE of what run_data_pipeline=False is trying to do; relying on the
+flag alone with unset fields is not a combination AF3's own docs define
+the behavior of). Net effect: pass run_data_pipeline=False explicitly (or set
+af3.run_data_pipeline: false once in installation.yaml) and this backend
+needs nothing beyond model_dir to run — same setup cost as boltz/
+alphafold2, zero database infrastructure. run_data_pipeline still
+DEFAULTS to True here (matching AF3's own CLI default, and this
+project's own prior behavior) — this module doesn't change that default
+on your behalf, since real MSA/template search vs. running MSA-free is a
+genuine prediction-QUALITY tradeoff for your own designs, not just a
+setup-cost one, and better left an explicit choice than a silent
+default flip. Pass run_data_pipeline=True (and a real db_dir) if you
+specifically want AF3's own MSA/template search to run for real.
 """
 
 import glob
@@ -126,10 +149,27 @@ class AF3Job:
     extra_flags: List[str] = field(default_factory=list)
 
 
-def _write_candidate_json(path: str, candidate_id: str, sequence: str) -> None:
+def _write_candidate_json(path: str, candidate_id: str, sequence: str, msa_free: bool = False) -> None:
+    """
+    msa_free : when True, writes unpairedMsa/pairedMsa as "" and
+        templates as [] -- AF3's own documented mechanism (docs/input.md)
+        for "build no MSA/templates at all, model input is just the
+        query sequence" -- rather than leaving those keys out of the
+        JSON entirely, which docs/input.md instead defines as "build
+        both automatically" (the data pipeline's job -- meaningless, and
+        contradictory, on a run where the data pipeline isn't running at
+        all). See this module's own docstring for why this is paired
+        with run_data_pipeline=False rather than left to that CLI flag
+        alone.
+    """
+    protein_entry = {"id": ["A"], "sequence": sequence}
+    if msa_free:
+        protein_entry["unpairedMsa"] = ""
+        protein_entry["pairedMsa"] = ""
+        protein_entry["templates"] = []
     payload = {
         "name": candidate_id,
-        "sequences": [{"protein": {"id": ["A"], "sequence": sequence}}],
+        "sequences": [{"protein": protein_entry}],
         "modelSeeds": [1],
         "dialect": "alphafold3",
         "version": 1,
@@ -156,14 +196,19 @@ def prepare_self_consistency_job(
         module docstring). This module never fetches or assumes a
         default location, on purpose.
     db_dir : the genetic/template database directory run_data_pipeline
-        needs. Required unless run_data_pipeline=False (e.g. you're
-        supplying pre-computed MSAs some other way outside this module).
+        needs to search for real MSA/template hits. NOT required when
+        run_data_pipeline=False — see this module's own docstring for
+        why (short version: confirmed against AF3's own source that
+        db_dir is never read in that case, and every candidate's JSON is
+        written MSA/template-free instead, AF3's own documented way to
+        run without either).
     """
     if run_data_pipeline and not db_dir:
         raise ValueError(
             "db_dir is required when run_data_pipeline=True (the default) — AF3's own data "
-            "pipeline needs its genetic/template database directory. Pass db_dir=..., or set "
-            "run_data_pipeline=False if you're supplying MSAs some other way."
+            "pipeline needs its genetic/template database directory to search for real MSA/"
+            "template hits. Pass db_dir=..., or set run_data_pipeline=False to run MSA/template-"
+            "free instead (needs no database directory at all — see this module's docstring)."
         )
 
     reference_map = build_reference_map(selected_df, design_paths)
@@ -175,7 +220,10 @@ def prepare_self_consistency_job(
     os.makedirs(input_dir, exist_ok=True)
 
     for candidate_id, entry in reference_map.items():
-        _write_candidate_json(os.path.join(input_dir, f"{candidate_id}.json"), candidate_id, entry["sequence"])
+        _write_candidate_json(
+            os.path.join(input_dir, f"{candidate_id}.json"), candidate_id, entry["sequence"],
+            msa_free=not run_data_pipeline,
+        )
 
     return AF3Job(
         input_dir=input_dir, out_dir=out_dir, reference_map=reference_map, model_dir=model_dir,

@@ -175,12 +175,22 @@ af3:
   # from Google under their terms:
   # model_dir: /path/to/af3/models
 
-  # REQUIRED unless you pass run_data_pipeline: false — AF3's own
-  # genetic/template database directory. Unlike alphafold2/boltz above,
-  # AF3 has no free hosted MSA search option built in, so this is a
-  # much larger local disk/setup commitment (hundreds of GB) than either
-  # other backend — see af3.py's own docstring.
+  # REQUIRED only if run_data_pipeline is True (the default) — AF3's own
+  # genetic/template database directory, needed to search for real MSA/
+  # template hits. Unlike alphafold2/boltz above, AF3 has no free hosted
+  # MSA search option built in, so this is a much larger local disk/
+  # setup commitment (hundreds of GB) than either other backend.
   # db_dir: /path/to/af3/public_databases
+
+  # Set this to skip AF3's data pipeline (MSA/template search) entirely —
+  # needs NO db_dir at all when False (confirmed against AF3's own
+  # source and docs — see af3.py's own module docstring for the full
+  # explanation). ProteinMPNN-designed sequences are often novel enough
+  # that a real search turns up little anyway, so this is a genuine way
+  # to run AF3 with zero extra infrastructure beyond model_dir — the
+  # tradeoff is prediction quality, not just setup cost, so it's left an
+  # explicit opt-in rather than this project's own default.
+  # run_data_pipeline: false
 
   # singularity_image: /path/to/af3.sif   # built from AF3's own Dockerfile
   # inner_backend: singularity            # only used with backend: slurm
