@@ -4,9 +4,12 @@ message: >-
   file.
 title: SymBro
 abstract: >-
-  A CLI/pipeline for symmetry-broken protein cage design: RCSB query,
-  download, symmetry-ring geometry analysis, ring subunit isolation,
-  RFdiffusion, ProteinMPNN, and structure-prediction screening.
+  A CLI/pipeline for symmetry-broken protein cage design, covering the
+  full pipeline end to end: RCSB query (or your own local structure
+  files), download, symmetry-ring geometry analysis, ring subunit
+  isolation, RFdiffusion, ProteinMPNN, structure-prediction screening
+  (self-consistency RMSD/pLDDT), and codon-optimized, orderable DNA
+  sequences.
 type: software
 authors:
   - given-names: Nicholas Alexander
@@ -16,7 +19,8 @@ authors:
       Centro Nacional de Investigaciones Oncológicas / Universitat de
       Girona
   # Additional authors/contributors to be added here as they join.
-version: 0.1.0
+version: 1.0.0
+date-released: "2026-08-18"
 license: Apache-2.0
 repository-code: "https://github.com/Envee-42/SymBro"
 url: "https://github.com/Envee-42/SymBro"

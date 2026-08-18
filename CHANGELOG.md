@@ -1,0 +1,81 @@
+# Changelog
+
+All notable changes to SymBro are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [1.0.0] - 2026-08-18
+
+First stable release. SymBro now covers the full symmetry-broken protein
+cage design pipeline end to end, from an RCSB search (or your own local
+structure file) to a codon-optimized, orderable DNA sequence, entirely
+through the `symbro` CLI.
+
+### Added
+
+- **Full 11-command pipeline**, each stage resuming automatically from a
+  `.symbro/` checkpoint written by the previous one:
+  - `symbro query` — search RCSB PDB for candidate assemblies.
+  - `symbro download` — download the matching structure files.
+  - `symbro local` — register your own local PDB/CIF file(s) as an
+    alternative entry point to `query` + `download`.
+  - `symbro geometry` — detect symmetry rings (and orientation/termini).
+  - `symbro isolate` — extract each ring's PDB, ready for RFdiffusion.
+  - `symbro rfdiffusion` / `symbro status` — submit RFdiffusion jobs
+    (local, Singularity, or SLURM backends) and poll detached runs.
+  - `symbro pmpnn` — run ProteinMPNN against each assembly's best design(s).
+  - `symbro predict` — fold candidates back through a structure-prediction
+    backend (`boltz`, `af2`/`alphafold2`, `af3`/`alphafold3`) and screen by
+    self-consistency RMSD/pLDDT, with `--top-n`/`--max-rmsd`/`--min-plddt`
+    filtering.
+  - `symbro codon` — reverse-translate validated designs into
+    host-codon-optimized DNA (optional `symbro[codon]` extra, via
+    DNAChisel + python_codon_tables), with GC-content, homopolymer,
+    hairpin, k-mer-repeat, and Golden Gate enzyme-site safety checks.
+  - `symbro clean` — clear `.symbro/` checkpoints and scratch directories
+    between runs (`--keep-*`/`--dry-run` flags).
+- **AF3 MSA/template-free shortcut** (`--backend af3`, `run_data_pipeline`
+  flag): lets AF3 run without its multi-hundred-GB genetic database
+  directory when a full data pipeline isn't needed.
+- **Onboarding kit**: an `examples/` directory with four worked walkthroughs
+  (full pipeline, flag/narrowing reference, SLURM detach workflow, and a
+  local analysis notebook for exploring a completed run's results) plus a
+  `minimal_scripts/` quick-start (`launch.sh`/`launch.ps1`/`Instructions.txt`).
+- **Two Colab notebooks** (`symbro_rfdiffusion_colab.ipynb`,
+  `symbro_full_pipeline_colab.ipynb`) for running the GPU-bound stages on
+  hosted infrastructure when no local/HPC GPU is available.
+- **Shared checkpoint-join helper** (`pipeline.join_predict_with_pmpnn()`)
+  used by both `symbro codon` and the analysis notebook, replacing
+  duplicated join logic and fixing a real dtype-mismatch bug in the
+  process (narrowed, all-non-null `predict` frames failed to merge against
+  the un-narrowed `pmpnn` frame).
+- Per-machine tool configuration via `installation.yaml`
+  (`installation.example.yaml` as the template), supporting local,
+  Singularity, and SLURM backends for RFdiffusion and ProteinMPNN.
+
+### Fixed
+
+- Hardcoded, machine-specific local paths removed from `run_predictor.py`
+  and replaced with portable placeholders / relative paths.
+- RFdiffusion SLURM submission script no longer crashes under `nounset`
+  when `setup_lines` is empty.
+- Cross-machine checkpoint path portability (`.symbro/` state now resolves
+  correctly regardless of which machine/OS wrote it).
+- `join_predict_with_pmpnn()` / `_component_key()` dtype mismatch that
+  raised `ValueError` when merging a narrowed (pure float64) `predict`
+  frame against an un-narrowed (object-dtype) `pmpnn` frame.
+
+### Testing
+
+- 132 tests across the CLI layer, pipeline stages, and each backend
+  integration (RFdiffusion/ProteinMPNN HPC scripts, `predict`, `codon`,
+  `local`, `af3`), run against real code paths with mocking limited to the
+  true external I/O boundary (cluster submission/polling, RCSB network
+  calls) per this project's own testing convention.
+- RFdiffusion and ProteinMPNN's SLURM backends have been exercised for
+  real against a live HPC cluster; the CLI layer on top of `predict` has
+  not yet had a live end-to-end run against real infrastructure — tracked
+  as the next verification milestone.
+
+[1.0.0]: https://github.com/Envee-42/SymBro/releases/tag/v1.0.0
