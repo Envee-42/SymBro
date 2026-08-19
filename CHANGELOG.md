@@ -42,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   aggressive a call to make without a human looking at which chains were
   left unclaimed. Pass `--no-warn-incomplete-axes` to skip it.
 
+### Documentation
+
+- Added a "Structure-prediction backend status" section to the README
+  recording real end-to-end SLURM testing results on our own HPC cluster
+  for all three predictor backends: `af2` works but silently fell back
+  to CPU due to a driver/CUDA mismatch; `boltz`'s earlier failure was
+  root-caused to a corrupted local model cache, fix applied but not yet
+  reconfirmed; `af3` is blocked specifically by this cluster's GPU
+  driver (`525.60.13`) being one full CUDA release behind what its
+  pinned `jax[cuda12]` build requires, not by anything in symbro's own
+  config. None of these are symbro bugs -- recorded so they don't need
+  re-diagnosing later.
+
 ## [1.0.0] - 2026-08-18
 
 First stable release. SymBro now covers the full symmetry-broken protein
