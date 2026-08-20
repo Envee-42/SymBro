@@ -30,6 +30,35 @@ repeated subunits rather than fitting a global rotation matrix):
   Cα-Cα distance <= contact_cutoff) — homogeneous termini distances alone
   can't rule out two unrelated, non-adjacent copies that merely sit at a
   similar distance apart.
+- For order >= 3, the SAME set of chains can pass homogeneity + contact
+  via more than one distinct cyclic direction — most commonly the real
+  forward ring and a "skip past your actual neighbor" reverse reading of
+  the same chains, which the rotational symmetry that makes the real
+  ring's steps self-consistent can make JUST as self-consistent (in a
+  real structure, more so — see _closest_direction_per_chain_set's own
+  docstring for a concrete example where the wrong direction's CV won).
+  Whole-chain contact can't tell them apart either, since every chain in
+  a compact oligomer touches every other chain somewhere regardless of
+  which direction is being tested. find_cyclic_groupings resolves this
+  itself — keeping only the closest-termini direction per chain set —
+  rather than leaving it for select_disjoint_groupings' exclusivity
+  resolution to decide: this project's fusion design goal specifically
+  wants the nearest N-to-C junction, so shortest distance is the
+  physically meaningful tiebreak here, not just a convenient one.
+- The same ambiguity recurs one level up, ACROSS different chain sets
+  rather than within one: a higher-symmetry cage (T/O/I, or just a
+  crowded packing) can have more than one disjoint way to partition its
+  chains into same-order rings, all independently passing homogeneity +
+  contact (confirmed on a real T-symmetric 12-chain assembly: the true
+  build-order trimers at ~26 Å junctions, AND a second, entirely
+  different partition mixing chains across those true trimers at ~58 Å
+  junctions — roughly double the distance — with a tighter CV than the
+  true trimers'). CV alone can't tell these apart, for the same reason
+  it can't resolve direction: internal step-regularity doesn't imply
+  physical proximity. select_disjoint_groupings therefore sorts
+  closest-mean-distance-first (CV/std only break remaining ties), so
+  the nearest-termini reading wins exclusivity resolution too — the
+  identical rationale as the direction fix above, applied one level up.
 - Every order this module detects — C2 included — is a head-to-tail (N-C)
   register: a rotational symmetry axis is, by definition, a repeating
   N-to-C arrangement of identical subunits around the axis. find_c2_groupings
@@ -39,10 +68,12 @@ repeated subunits rather than fitting a global rotation matrix):
   docstring for the history here — N-N/C-C used to be accepted too, which
   was a bug, not a design choice).
 - Within one order, a chain may only belong to ONE accepted grouping
-  (resolved by greedily accepting candidates tightest-CV-first and
-  discarding anything that reuses an already-claimed chain). ACROSS
-  orders there's no such restriction — a chain sitting on a C2 axis and a
-  C3 axis simultaneously is exactly how a T/O/I cage is built.
+  (resolved by greedily accepting candidates closest-termini-first and
+  discarding anything that reuses an already-claimed chain — see
+  select_disjoint_groupings' own docstring for why distance, not CV,
+  is the primary sort key here too). ACROSS orders there's no such
+  restriction — a chain sitting on a C2 axis and a C3 axis
+  simultaneously is exactly how a T/O/I cage is built.
 - Output has one row per detected axis order PER STRUCTURALLY DISTINCT
   COMPONENT per assembly — never one row per individual grouping, but
   also never one row that silently pools multiple different proteins
@@ -294,14 +325,16 @@ def find_c2_groupings(
     head-to-head or tail-to-tail instead. That was a bug, not a design
     choice: an N-N or C-C contact is a single distance measurement, so its
     population std is trivially 0.0 and its CV is trivially 0.0 — which
-    means it would ALWAYS out-rank a real two-measurement N-C candidate in
-    select_disjoint_groupings' CV-tightest-first sort, even when a
-    genuine, tolerance-and-contact-passing N-C axis was also present for
-    the same pair. In practice this meant a nearby but non-rotational
-    tail-to-tail or head-to-head contact would almost always be reported
-    as "the" C2 axis instead of the real one. Restricting this function to
-    N-C only removes the false positives and the ranking bias in one move,
-    and brings C2 in line with how C3/C4/C5 were already being detected.
+    meant it would ALWAYS out-rank a real two-measurement N-C candidate
+    under select_disjoint_groupings' sort at the time (CV-first), even
+    when a genuine, tolerance-and-contact-passing N-C axis was also
+    present for the same pair. In practice this meant a nearby but
+    non-rotational tail-to-tail or head-to-head contact would almost
+    always be reported as "the" C2 axis instead of the real one.
+    Restricting this function to N-C only removes the false positives and
+    that ranking bias in one move (independent of select_disjoint_groupings'
+    own current sort key — see that function's docstring), and brings C2
+    in line with how C3/C4/C5 were already being detected.
     """
     n_coords = _terminal_coords(chain_geometry, chain_names, "N")
     c_coords = _terminal_coords(chain_geometry, chain_names, "C")
@@ -332,6 +365,44 @@ def find_c2_groupings(
     return results
 
 
+def _closest_direction_per_chain_set(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    A chain SET of order >= 3 can pass step-homogeneity + contact via more
+    than one distinct cyclic traversal of the SAME chains -- most commonly
+    the two opposite rotational directions around one ring (order 4/5 can
+    in principle have others too), since find_cyclic_groupings treats
+    every directed C->N edge in range as a candidate step, not just
+    genuinely adjacent ones. Only ONE traversal is the real, physically
+    fused N-to-C junction.
+
+    Neither of this module's own existing checks can tell the two apart.
+    Step-homogeneity can't: the SAME rotational symmetry that makes the
+    correct direction's steps internally consistent (tight CV) makes a
+    "skip past your real neighbor" direction internally consistent too --
+    confirmed against a real PDB entry where the WRONG direction's CV
+    (0.0010) was tighter than the correct direction's (0.0065), so a
+    CV-based selection would actively prefer it. Contact doesn't
+    discriminate either: _has_contact checks the whole chain, and in a
+    compact oligomer every chain touches every other chain somewhere
+    regardless of which N-C register is being tested.
+
+    What DOES discriminate, for this project specifically: symmetry
+    breaking here means fusing consecutive subunits at their nearest
+    termini, by design -- so the shorter-mean-distance direction is the
+    physically meaningful junction, not just a convenient tiebreak.
+    Groups candidates by chain_set (frozenset -- direction-independent)
+    and keeps only the smallest-mean_distance one per group; a chain_set
+    with only one passing candidate (the common case) is untouched.
+    """
+    best_by_chain_set: Dict[frozenset, Dict[str, Any]] = {}
+    for candidate in candidates:
+        key = candidate["chain_set"]
+        current_best = best_by_chain_set.get(key)
+        if current_best is None or candidate["mean_distance"] < current_best["mean_distance"]:
+            best_by_chain_set[key] = candidate
+    return list(best_by_chain_set.values())
+
+
 def find_cyclic_groupings(
     chain_names: Sequence[str], chain_geometry: Dict[str, dict], order: int,
     tolerance: Optional[float] = DEFAULT_TOLERANCE, relative_tolerance: Optional[float] = DEFAULT_RELATIVE_TOLERANCE,
@@ -343,9 +414,16 @@ def find_cyclic_groupings(
     C-terminus -> N-terminus candidate graph — chain_1(C) -> chain_2(N) ->
     chain_2(C) -> ... -> chain_1(N) — keeping only cycles whose `order`
     step distances pass the step-homogeneity test and whose every
-    consecutive chain pair is in real contact. Returns every surviving
-    candidate (possibly overlapping in chain membership); exclusivity is
-    resolved separately by select_disjoint_groupings.
+    consecutive chain pair is in real contact. Where the SAME set of
+    chains passes via more than one distinct cyclic direction (see
+    _closest_direction_per_chain_set), only the closest-termini one is
+    kept -- the other direction is a false positive, not a genuine
+    alternate ring, so it's resolved here rather than left for
+    select_disjoint_groupings to (incorrectly, per CV alone) choose
+    between. Returns every surviving candidate (possibly still
+    overlapping in chain membership ACROSS different chain sets);
+    exclusivity across those is resolved separately by
+    select_disjoint_groupings.
     """
     if order not in CYCLIC_ORDERS:
         raise ValueError(f"order must be one of {CYCLIC_ORDERS} — C2 is handled by find_c2_groupings")
@@ -389,20 +467,32 @@ def find_cyclic_groupings(
             "cv": round(cv, 4) if np.isfinite(cv) else None,
         })
 
-    return results
+    return _closest_direction_per_chain_set(results)
 
 
 def select_disjoint_groupings(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Enforces the exclusivity rule for one order: sorts candidates
-    tightest-first (ascending CV, then std, then mean, so ordering is
-    deterministic; a degenerate cv=None sorts last), then greedily accepts
-    each candidate whose chains are still entirely unclaimed. A tight,
-    early-accepted grouping gets first claim on its chains, so the result
-    is disjoint by construction and always favors the geometrically
-    tightest reading of the data.
+    closest-termini-first (ascending mean_distance, then std, then cv, so
+    ordering is deterministic; a degenerate cv=None sorts last), then
+    greedily accepts each candidate whose chains are still entirely
+    unclaimed. A close, early-accepted grouping gets first claim on its
+    chains, so the result is disjoint by construction.
+
+    mean_distance is the primary key, not CV, even though CV measures a
+    real property (step-to-step regularity around the ring) that a
+    genuine axis should also have. The reason: CV can't distinguish a
+    physically-adjacent ring from a same-order, equally-self-consistent
+    but non-adjacent one — confirmed on a real assembly where a
+    same-chain-set reverse-direction candidate (resolved by
+    find_cyclic_groupings/_closest_direction_per_chain_set before
+    candidates even reach here) AND a different-chain-set candidate
+    spanning two separate true rings both had tighter CVs than the
+    correct, physically nearest grouping. This project's fusion design
+    goal is specifically the nearest N-to-C junction, so distance is the
+    physically meaningful primary sort here, not a secondary refinement.
     """
-    ordered = sorted(candidates, key=lambda c: (c["cv"] if c["cv"] is not None else float("inf"), c["std_distance"], c["mean_distance"]))
+    ordered = sorted(candidates, key=lambda c: (c["mean_distance"], c["std_distance"], c["cv"] if c["cv"] is not None else float("inf")))
 
     claimed: set = set()
     accepted: List[Dict[str, Any]] = []

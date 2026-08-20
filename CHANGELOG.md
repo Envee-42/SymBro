@@ -56,6 +56,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   this first pass: one structure per view, colored by chain; no overlay
   of two structures or symmetry-axis drawing yet.
 
+### Fixed
+
+- **Ring-detection direction/exclusivity bug** (`symbro geometry`, C3/C4/C5
+  rings): for a chain set of order >= 3, the C-terminus -> N-terminus
+  cycle search could accept either the true forward ring or an equally
+  step-homogeneous "skip past your real neighbor" reverse reading of the
+  exact same chains -- and, one level up, a higher-symmetry assembly
+  (e.g. a T-symmetric 12-chain cage) could have more than one disjoint
+  way to partition its chains into same-order rings, all independently
+  passing detection. CV (step-to-step regularity) couldn't distinguish
+  either case from the truth, and on a real, reported case (PDB 4EGG) it
+  actively preferred the wrong answer both times -- first a
+  reversed-direction trimer at ~70 A instead of the correct ~26-29 A
+  junction, then, after fixing the direction, a cross-trimer partition at
+  ~58-59 A instead. Both are now resolved the same way, per this
+  project's own fusion-design goal (closest N-to-C termini get fused):
+  `find_cyclic_groupings` keeps only the closest-termini direction per
+  chain set, and `select_disjoint_groupings` now sorts
+  closest-mean-distance-first (CV/std remain as tiebreakers) instead of
+  CV-first. Verified against the real 4EGG structure: now correctly
+  recovers its 4 true C3 trimers (~26-27 A junctions, matching the
+  originally reported ~29 A figure) instead of the wrong-direction or
+  cross-trimer readings.
+
 ### Documentation
 
 - Added a "Structure-prediction backend status" section to the README
