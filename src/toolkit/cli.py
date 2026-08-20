@@ -1,4 +1,4 @@
-"""
+r"""
 cli.py — the `symbro` command. A thin layer over pipeline.py: parses
 arguments, calls the matching pipeline stage function, and prints a
 clear, human-readable summary or error. No pipeline logic lives here --
@@ -743,7 +743,7 @@ def codon(
         None, "--fasta", help="Where to write the orderable FASTA (default: <state-dir>/codon.fasta)."
     ),
 ):
-    """
+    r"""
     Reverse-translate symbro predict's validated designs into host-codon-optimized DNA (needs the
     "codon" extra: pip install symbro\[codon]), applying standard gene-synthesis safety checks (GC
     content, homopolymer runs, hairpins, repeats, common Golden Gate enzyme sites). Produces a strong
