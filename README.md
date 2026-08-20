@@ -17,6 +17,7 @@ Given a symmetry type you're interested in (e.g. C3, meaning three identical cop
 | — | `symbro local` | *Alternative* to `query`+`download`: register your own local PDB/CIF file(s) instead of searching RCSB |
 | 3 | `symbro geometry` | Detect symmetry rings in each structure (and orientation/termini secondary structure, for one chosen symmetry order). Also cross-checks each assembly against RCSB's own annotated symmetry and drops any that don't match (`--no-validate-symmetry` to disable — see below), and warns (never drops) on any surviving ring that didn't claim every eligible chain (`--no-warn-incomplete-axes` to disable — see below) |
 | 4 | `symbro isolate` | Extract each ring's own structure file, ready for RFdiffusion |
+| — | `symbro view` | Render a structure (a direct file, or `--stage downloaded`/`rings` + `--assembly-id`) as a self-contained, interactive 3D HTML file — see below |
 | 5 | `symbro rfdiffusion` | Submit RFdiffusion (an AI model that generates new protein backbone shapes) — one job per assembly — locally, via Singularity, or to a SLURM cluster |
 | — | `symbro status` | Check on `--detach`'d RFdiffusion jobs |
 | 6 | `symbro pmpnn` | Run ProteinMPNN (an AI model that fills in an amino-acid sequence for a given backbone shape) against each assembly's best RFdiffusion design(s) |
@@ -132,6 +133,21 @@ Pass `--no-validate-symmetry` to keep every detected ring regardless of what RCS
 A separate, independent check: even when the annotated axis *type* is correctly confirmed, not every eligible chain in a component necessarily ends up claimed by a detected ring. By default, `symbro geometry` also compares each surviving row's `axis_count` against the most disjoint rings that component's own chain count could possibly support (`component_chain_count // order` — e.g. 24 usable chains toward a C3 ring can support at most 8 disjoint triplets) and prints a warning for any row that falls short, naming how many rings were found versus how many were possible.
 
 This is *not* an annotation problem — the axis type itself is genuinely present — so, unlike the cross-check above, a shortfall here never drops the assembly. It most often reflects real, chain-specific structural disorder in that particular deposition (a partially unmodeled loop, local flexibility that breaks the geometric register for just those chains), which is worth knowing about before committing RFdiffusion/ProteinMPNN compute to a candidate, but isn't on its own a reason to discard it. Pass `--no-warn-incomplete-axes` to skip this check.
+
+### 3D visualization
+
+```bash
+# a structure file directly
+symbro view temporary_subunits/1ABC-1_C3_A-B-C.pdb
+
+# or looked up from a checkpoint
+symbro view --stage downloaded --assembly-id 1ABC-1
+symbro view --stage rings --assembly-id 1ABC-1 --component-id 0
+```
+
+`symbro view` renders a structure as a single, self-contained HTML file — an interactive, chain-colored 3D view (rotate/zoom/pan with the mouse) via [3Dmol.js](https://3dmol.org). It's the one command in this pipeline that needs *nothing* beyond `pip install symbro`: no `installation.yaml` entry, no external tool, no GPU, and — deliberately, since this needs to work for anyone downloading symbro, not just on any one lab's own hardware — no network access either, to generate the file OR to open it later. The entire viewer library is vendored inside the package itself (`toolkit/static/3dmol/`, see that directory's `NOTICE.md` for exact version/provenance/license) and embedded directly into the output, rather than linked from a CDN.
+
+`--stage` accepts `downloaded` (the full assembly, from `symbro query`+`download` or `symbro local`) or `rings` (one isolated ring/component, from `symbro isolate`) — pass `--component-id` to disambiguate a multi-component assembly. Output defaults to the input's own basename with a `.html` extension; override with `--output`. Scope is deliberately narrow for now: one structure per view, colored by chain — no overlay of two structures (e.g. an RFdiffusion backbone against its predicted candidate) and no drawing of a detected symmetry axis as a 3D shape yet, both left for later.
 
 ## Quickstart
 

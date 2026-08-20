@@ -57,3 +57,12 @@ symbro = "toolkit.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Vendored 3Dmol.js (symbro view / toolkit/viz.py) -- see
+# src/toolkit/static/3dmol/NOTICE.md for version/provenance/license. Not
+# a package itself (no __init__.py, "3dmol" isn't even a valid Python
+# identifier) -- just a data directory shipped inside the "toolkit"
+# package so it's present wherever symbro is installed, no separate
+# download step.
+toolkit = ["static/3dmol/*"]

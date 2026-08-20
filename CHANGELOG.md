@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   aggressive a call to make without a human looking at which chains were
   left unclaimed. Pass `--no-warn-incomplete-axes` to skip it.
 
+- **`symbro view`**: renders a structure (a direct file path, or
+  `--stage downloaded`/`rings` + `--assembly-id`/`--component-id`) as a
+  self-contained, interactive 3D HTML file via a vendored copy of
+  3Dmol.js (`toolkit/static/3dmol/`, BSD-3-Clause -- see that directory's
+  `NOTICE.md` for exact version/provenance/license). Deliberately the one
+  command in this pipeline needing nothing beyond `pip install symbro`:
+  no `installation.yaml` entry, no external tool, no GPU, and no network
+  access either to generate the file or to open it later, since the
+  entire viewer library is embedded in the output rather than
+  CDN-linked -- meant to work identically for anyone who downloads
+  symbro, not just on any one lab's own hardware. Scope kept lean for
+  this first pass: one structure per view, colored by chain; no overlay
+  of two structures or symmetry-axis drawing yet.
+
 ### Documentation
 
 - Added a "Structure-prediction backend status" section to the README

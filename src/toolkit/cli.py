@@ -13,6 +13,8 @@ Typical workflow, run in order:
                          local PDB/CIF file(s) instead of searching RCSB
     symbro geometry      detect symmetry rings (and orientation/termini for one type)
     symbro isolate       extract each ring's PDB, ready for RFdiffusion
+    symbro view          render a structure as an interactive 3D HTML file
+                         (a direct path, or --stage downloaded/rings + --assembly-id)
     symbro rfdiffusion   submit RFdiffusion, one job per assembly (blocks until done
                          unless --detach, which needs backend='slurm')
     symbro status        check on --detach'd RFdiffusion jobs
@@ -417,6 +419,70 @@ def isolate(
     if not df.empty:
         console.print(f"  Saved to [cyan]{ctx.obj['state_dir']}/rings.pkl[/cyan] (preview: rings.csv)")
         console.print("  Next: [bold]symbro rfdiffusion[/bold]")
+
+
+@app.command()
+def view(
+    ctx: typer.Context,
+    path: Optional[str] = typer.Argument(
+        None, help="A .pdb/.ent or .cif/.mmcif file to render directly. Omit to look one up "
+                    "from a checkpoint instead, via --stage/--assembly-id.",
+    ),
+    stage: Optional[str] = typer.Option(
+        None, help="Look up the structure from a checkpoint instead of a direct PATH: "
+                    "'downloaded' (the full assembly) or 'rings' (one isolated ring/component, "
+                    "from `symbro isolate`). Requires --assembly-id.",
+    ),
+    assembly_id: Optional[str] = typer.Option(None, help="Required together with --stage."),
+    component_id: Optional[int] = typer.Option(
+        None, help="For --stage rings on a multi-component assembly (e.g. a two-protein cage) "
+                    "-- narrows to one component's row. Omit for a single-component assembly.",
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Where to write the HTML view. Default: next to the "
+                                      "structure file, same basename with a .html extension.",
+    ),
+):
+    """
+    Render a structure as a self-contained, interactive 3D HTML view.
+
+    Open the result in any browser -- no server, no network, no external
+    tool or GPU needed, either to generate it or to view it (the 3Dmol.js
+    viewer is bundled inside symbro itself and embedded directly in the
+    output file). Colors by chain; rotate/zoom/pan with the mouse.
+    """
+    from toolkit import viz
+
+    if (path is None) == (stage is None):
+        _fail("Pass exactly one of PATH or --stage.")
+    if stage is not None and assembly_id is None:
+        _fail("--stage requires --assembly-id.")
+
+    if stage is not None:
+        try:
+            path = pipeline.resolve_structure_path(
+                stage, assembly_id, component_id=component_id, state_dir=ctx.obj["state_dir"],
+            )
+        except pipeline.StageNotFoundError as exc:
+            _fail(str(exc))
+        except ValueError as exc:
+            _fail(str(exc))
+
+    if not os.path.exists(path):
+        _fail(f"No such file: {path!r}")
+
+    resolved_output = output or os.path.splitext(path)[0] + ".html"
+    try:
+        written = viz.render_to_file(path, resolved_output, title=assembly_id or os.path.basename(path))
+    except ValueError as exc:
+        _fail(str(exc))
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(f"Rendering failed: {exc}")
+
+    console.print(f"[bold green]✓[/bold green] Wrote [cyan]{written}[/cyan]")
+    console.print("  Open it in any browser to view -- no server needed.")
 
 
 @app.command()

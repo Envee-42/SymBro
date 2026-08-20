@@ -635,6 +635,65 @@ def run_isolate(
     return df
 
 
+# "symbro view" (viz.py does the actual HTML rendering; this only resolves
+# WHICH file a --stage/--assembly-id lookup means) -- "downloaded" and
+# "rings" only, deliberately: both have exactly one unambiguous filepath
+# per assembly_id (barring rings.pkl's multi-symmetry_type case, handled
+# below), unlike rfdiffusion/pmpnn/predict, each of which needs its own
+# design/candidate SELECTION logic (ranking, top_n, ...) before "the"
+# file is even well-defined -- left for a later pass rather than guessed
+# at here.
+_VIEWABLE_STAGES = {"downloaded": DOWNLOADED_STAGE, "rings": ISOLATE_STAGE}
+
+
+def resolve_structure_path(
+    stage: str, assembly_id: str, component_id: Optional[int] = None, state_dir: str = DEFAULT_STATE_DIR,
+) -> str:
+    """
+    Looks up a single structure file path from an existing checkpoint, for
+    `symbro view --stage ... --assembly-id ...`. stage is "downloaded"
+    (the full assembly, from run_query()+run_download() or run_local()) or
+    "rings" (one isolated ring/component, from run_isolate()) -- see
+    _VIEWABLE_STAGES' own comment for why only these two.
+
+    Resolves the checkpoint's stored (portable, possibly relative --
+    see paths.py) filepath back to one valid from the current working
+    directory before returning it, same as every other consumer of a
+    "filepath" column already must.
+
+    Raises ValueError (uncaught here -- the CLI layer decides how to
+    present it) if stage is invalid, no row matches assembly_id/
+    component_id, or more than one row still matches after filtering
+    (e.g. an assembly with multiple symmetry_types in rings.pkl -- narrow
+    with component_id, or re-run `symbro isolate --symmetry-type` to
+    isolate just one order). Raises StageNotFoundError if the checkpoint
+    itself doesn't exist yet.
+    """
+    from toolkit import paths as _paths
+
+    if stage not in _VIEWABLE_STAGES:
+        raise ValueError(f"stage must be one of {sorted(_VIEWABLE_STAGES)} -- got {stage!r}.")
+    df = load_checkpoint(_VIEWABLE_STAGES[stage], state_dir, needed_by=f"Viewing a {stage!r} structure")
+
+    subset = df[df["assembly_id"] == assembly_id]
+    if component_id is not None:
+        if "component_id" not in subset.columns:
+            raise ValueError(f"component_id was given, but the {stage!r} checkpoint has no 'component_id' column.")
+        subset = subset[subset["component_id"] == component_id]
+
+    narrowing = f"assembly_id={assembly_id!r}" + (f", component_id={component_id!r}" if component_id is not None else "")
+    if subset.empty:
+        raise ValueError(f"No {stage!r} row for {narrowing}.")
+    if len(subset) > 1:
+        detail = subset["symmetry_type"].tolist() if "symmetry_type" in subset.columns else [None] * len(subset)
+        raise ValueError(
+            f"{len(subset)} rows matched {narrowing} in the {stage!r} checkpoint ({detail}) -- "
+            f"narrow further with --component-id, or re-run `symbro isolate --symmetry-type` "
+            f"to isolate just one order."
+        )
+    return _paths.resolve_path(subset.iloc[0]["filepath"])
+
+
 # ----------------------------------------------------------------------
 # Stage 5: RFdiffusion (batch-per-assembly: one job per rings.pkl row)
 # ----------------------------------------------------------------------

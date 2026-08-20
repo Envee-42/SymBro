@@ -13,3 +13,5 @@ installation.yaml
 /ProteinMPNN/
 *.egg-info/
 *.zip
+/build/
+/dist/
