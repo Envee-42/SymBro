@@ -170,6 +170,174 @@ def test_optimize_sequence_no_stop_codon_when_disabled():
     assert dnachisel.translate(result["dna_sequence"]) == SEQ_A
 
 
+def test_optimize_sequence_skips_objective_step_when_constraints_unresolved(monkeypatch):
+    """Regression test for a real crash bug found while investigating an
+    HPC run's codon-optimization results: optimize() used to be called
+    UNCONDITIONALLY, even right after resolve_constraints() had already
+    raised NoSolutionError. DNAChisel's own optimize() requires every
+    constraint to already be verified (confirmed directly against its
+    source, ObjectivesMaximizerMixin.optimize_by_exhaustive_search) and
+    raises its OWN NoSolutionError otherwise -- a second, previously-
+    uncaught exception that turned a should-be-recoverable "warn and
+    return the best-effort sequence" case (see this module's own
+    docstring) into an unhandled crash. optimize() must never run once
+    resolve_constraints() has already failed."""
+    from toolkit import codon
+
+    def fake_resolve(self, *a, **kw):
+        raise dnachisel.NoSolutionError("simulated failure", problem=self)
+
+    def fake_optimize(self):
+        raise AssertionError("optimize() must not be called after resolve_constraints() failed")
+
+    monkeypatch.setattr(dnachisel.DnaOptimizationProblem, "resolve_constraints", fake_resolve)
+    monkeypatch.setattr(dnachisel.DnaOptimizationProblem, "optimize", fake_optimize)
+
+    result = codon.optimize_sequence(SEQ_A, host="e_coli")  # must not raise
+    assert result["warnings"]
+    assert "simulated failure" in result["warnings"][0]
+    assert dnachisel.translate(result["dna_sequence"][:-3]) == SEQ_A
+
+
+def test_optimize_sequence_reverts_when_optimize_breaks_a_resolved_constraint(monkeypatch):
+    """Regression test for a real silent-corruption bug found the same
+    way: DNAChisel's own optimize() step does NOT guarantee it preserves
+    constraint satisfaction while improving the CodonOptimize objective
+    -- confirmed empirically (not assumed from docs) by reproducing it
+    against a protein with near-identical repeated domains (this
+    project's own fused-ring designs are exactly this shape): optimize()
+    can reintroduce a violation resolve_constraints() had just fixed,
+    with NO exception raised, leaving `warnings` empty -- the "safe,
+    common case" per this module's own docstring -- for a sequence that
+    actually violates one of its own constraints. Simulates that exact
+    shape (optimize() mutating .sequence into something that breaks the
+    real homopolymer constraint, without raising) and confirms the fix
+    catches it via all_constraints_pass() (evaluated for real against the
+    real constraints, not mocked) and reverts, rather than trusting an
+    empty warnings list."""
+    from toolkit import codon
+
+    def bad_optimize(self):
+        self.sequence = self.sequence[:10] + "AAAAAAAAAA" + self.sequence[20:]
+
+    monkeypatch.setattr(dnachisel.DnaOptimizationProblem, "optimize", bad_optimize)
+
+    result = codon.optimize_sequence(SEQ_A, host="e_coli", homopolymer_max=5)
+    assert result["warnings"]
+    assert "broke a constraint" in result["warnings"][0]
+    dna = result["dna_sequence"]
+    assert "AAAAAA" not in dna  # confirms an actual revert, not just a warning on the bad sequence
+    assert dnachisel.translate(dna[:-3]) == SEQ_A
+
+
+def test_optimize_sequence_max_attempts_default_does_not_retry(monkeypatch):
+    """max_attempts defaults to 1 -- a candidate that fails must behave
+    EXACTLY as it did before this feature existed: one attempt, one
+    warning message, no "After N attempts" framing. This is the
+    deliberate "don't auto-retry by default" contract."""
+    from toolkit import codon
+
+    calls = {"n": 0}
+
+    def fake_resolve(self, *a, **kw):
+        calls["n"] += 1
+        raise dnachisel.NoSolutionError("simulated failure", problem=self)
+
+    monkeypatch.setattr(dnachisel.DnaOptimizationProblem, "resolve_constraints", fake_resolve)
+
+    result = codon.optimize_sequence(SEQ_A, host="e_coli")  # max_attempts left at default (1)
+    assert calls["n"] == 1
+    assert len(result["warnings"]) == 1
+    assert result["warnings"][0] == "Could not fully satisfy every constraint: simulated failure"
+
+
+def test_optimize_sequence_max_attempts_stops_at_first_clean_result(monkeypatch):
+    """A candidate that fails twice then succeeds on a genuinely fresh
+    attempt (the real resolve_constraints(), not a simulated pass) must
+    be returned clean, with no more attempts made once one succeeds."""
+    from toolkit import codon
+
+    real_resolve = dnachisel.DnaOptimizationProblem.resolve_constraints
+    calls = {"n": 0}
+
+    def fake_resolve(self, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise dnachisel.NoSolutionError(f"simulated failure {calls['n']}", problem=self)
+        return real_resolve(self, *a, **kw)  # 3rd attempt: genuinely resolves for real
+
+    monkeypatch.setattr(dnachisel.DnaOptimizationProblem, "resolve_constraints", fake_resolve)
+
+    result = codon.optimize_sequence(SEQ_A, host="e_coli", max_attempts=5)
+    assert calls["n"] == 3  # stopped as soon as attempt 3 came back clean, not all 5
+    assert result["warnings"] == []
+    assert dnachisel.translate(result["dna_sequence"][:-3]) == SEQ_A
+
+
+def test_optimize_sequence_max_attempts_exhausted_returns_last_attempt(monkeypatch):
+    """A candidate that fails on every attempt must return the LAST
+    attempt's best-effort result once max_attempts is exhausted, with a
+    warning noting how many attempts were made -- not raise, and not
+    silently keep retrying forever."""
+    from toolkit import codon
+
+    calls = {"n": 0}
+
+    def fake_resolve(self, *a, **kw):
+        calls["n"] += 1
+        raise dnachisel.NoSolutionError(f"simulated failure {calls['n']}", problem=self)
+
+    monkeypatch.setattr(dnachisel.DnaOptimizationProblem, "resolve_constraints", fake_resolve)
+
+    result = codon.optimize_sequence(SEQ_A, host="e_coli", max_attempts=3)
+    assert calls["n"] == 3
+    assert "After 3 attempts" in result["warnings"][0]
+    assert "simulated failure 3" in result["warnings"][1]  # the LAST attempt's own message
+    assert dnachisel.translate(result["dna_sequence"][:-3]) == SEQ_A  # still a valid, translatable result
+
+
+def test_optimize_sequence_invalid_max_attempts_raises():
+    from toolkit import codon
+    with pytest.raises(ValueError, match="max_attempts"):
+        codon.optimize_sequence(SEQ_A, host="e_coli", max_attempts=0)
+
+
+def test_optimize_candidates_forwards_max_attempts(monkeypatch):
+    """optimize_candidates() passes max_attempts through via **kwargs --
+    confirmed by checking it actually reaches optimize_sequence(), not
+    just that it doesn't raise."""
+    from toolkit import codon
+
+    seen = []
+    real_optimize_sequence = codon.optimize_sequence
+
+    def spy(protein_sequence, **kwargs):
+        seen.append(kwargs.get("max_attempts"))
+        return real_optimize_sequence(protein_sequence, **kwargs)
+
+    monkeypatch.setattr(codon, "optimize_sequence", spy)
+    joined = pipeline.join_predict_with_pmpnn(_predict_df(), _pmpnn_df())
+    codon.optimize_candidates(joined, host="e_coli", max_attempts=2)
+    assert seen == [2, 2]  # both candidates got the forwarded value
+
+
+def test_symbro_codon_max_attempts_flag_forwards_to_run_codon(project_dir, monkeypatch):
+    from toolkit import pipeline as _pipeline
+
+    captured = {}
+    real_run_codon = _pipeline.run_codon
+
+    def spy(*a, **kw):
+        captured.update(kw)
+        return real_run_codon(*a, **kw)
+
+    monkeypatch.setattr(_pipeline, "run_codon", spy)
+    _write_checkpoints()
+    result = runner.invoke(app, ["codon", "--max-attempts", "4"])
+    assert result.exit_code == 0, result.output
+    assert captured["max_attempts"] == 4
+
+
 def test_optimize_sequence_different_host_changes_output():
     from toolkit import codon
     e_coli = codon.optimize_sequence(SEQ_A, host="e_coli")

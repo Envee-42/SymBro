@@ -986,11 +986,10 @@ def run_pmpnn(
     component, each processed independently here -- component_id is what
     lets the resulting pmpnn.pkl tell those apart afterward.
     """
-    import time as _time
-
     from toolkit import config as _config
     from toolkit import pmpnn as _pmpnn
     from toolkit import rfdiffusion as _rfdiffusion
+    from toolkit.polling import wait_for_terminal as _wait_for_terminal
 
     if rfdiffusion_df is None:
         rfdiffusion_df = load_checkpoint(RFDIFFUSION_STAGE, state_dir, needed_by="Running ProteinMPNN")
@@ -1055,15 +1054,19 @@ def run_pmpnn(
         )
         run = _pmpnn.submit(mpnn_job, config=cfg)
 
-        start = _time.time()
-        status = _pmpnn.poll_status(run)
-        while status["state"] not in _TERMINAL_STATES:
-            if _time.time() - start > timeout:
-                print(f"  {label}: timed out after {timeout}s waiting for ProteinMPNN "
-                      f"(local process -- check {run.log_path} by hand).")
-                break
-            _time.sleep(poll_interval)
-            status = _pmpnn.poll_status(run)
+        # wait_for_terminal() (toolkit/polling.py) does what a bare
+        # `while status["state"] not in _TERMINAL_STATES: ...` loop used to
+        # do here, PLUS re-checks a "completed_partial" state a few times
+        # before trusting it -- see that module's own docstring for the
+        # real, confirmed filesystem-visibility-lag failure mode this
+        # closes. A timeout hit while still "running" is reported the same
+        # way as before (status["state"] is still "running" in that case).
+        status = _wait_for_terminal(
+            lambda: _pmpnn.poll_status(run), poll_interval=poll_interval, timeout=timeout,
+        )
+        if status["state"] == "running":
+            print(f"  {label}: timed out after {timeout}s waiting for ProteinMPNN "
+                  f"(local process -- check {run.log_path} by hand).")
         print(f"  {label}: {status['state']} "
               f"({status['sequences_written']}/{status['sequences_expected']} sequences)")
 
@@ -1331,6 +1334,7 @@ def run_codon(
     avoid_repeats_kmer: Optional[int] = 15,
     avoid_enzymes: Optional[Sequence[str]] = None,
     add_stop_codon: bool = True,
+    max_attempts: int = 1,
     fasta_path: Optional[str] = None,
     state_dir: str = DEFAULT_STATE_DIR,
 ) -> pd.DataFrame:
@@ -1350,6 +1354,14 @@ def run_codon(
     _PREDICT_COLUMNS) -- join_predict_with_pmpnn() recovers it from
     pmpnn_df first. If predict_df/pmpnn_df aren't given, loads them from
     <state_dir>/predict.pkl and <state_dir>/pmpnn.pkl.
+
+    max_attempts : forwarded to codon.optimize_sequence() per candidate
+        -- see that function's own docstring. Default 1 (a single
+        attempt, today's behavior); pass a higher value (e.g. 3) to have
+        DNAChisel retry a candidate that hits its own genuine solver
+        randomness within this one command, rather than needing to notice
+        a "warnings"-flagged row and re-run `symbro codon` by hand. See
+        `symbro codon --max-attempts`.
 
     Saves the result to <state_dir>/codon.{pkl,csv} AND an orderable
     FASTA (default <state_dir>/codon.fasta, override with fasta_path=)
@@ -1385,7 +1397,7 @@ def run_codon(
         gc_window=gc_window, homopolymer_max=homopolymer_max, avoid_hairpins=avoid_hairpins,
         avoid_repeats_kmer=avoid_repeats_kmer,
         avoid_enzymes=avoid_enzymes if avoid_enzymes is not None else _codon.DEFAULT_ENZYMES_AVOIDED,
-        add_stop_codon=add_stop_codon,
+        add_stop_codon=add_stop_codon, max_attempts=max_attempts,
     )
     save_checkpoint(df, CODON_STAGE, state_dir)
 

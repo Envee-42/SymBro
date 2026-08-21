@@ -1,15 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# >=77 required for the PEP 639 "license" SPDX-string form below --
+# older setuptools can't parse it (see the license migration note there).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "symbro"
 version = "1.0.0"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
-classifiers = [
-    "License :: OSI Approved :: Apache Software License",
-]
+# PEP 639 SPDX license expression (setuptools>=77). This replaces both
+# the legacy `license = { text = "Apache-2.0" }` table form and the
+# separate "License :: OSI Approved :: Apache Software License"
+# classifier -- current setuptools deprecates that combination
+# (SetuptoolsDeprecationWarning: `project.license` as a TOML table is
+# deprecated) in favor of this single SPDX string.
+license = "Apache-2.0"
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.0",

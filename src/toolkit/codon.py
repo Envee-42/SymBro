@@ -26,6 +26,18 @@ sequence columns (the shape pipeline.join_predict_with_pmpnn() produces):
 Normally reached via `symbro codon` / pipeline.run_codon(), not called
 directly -- see cli.py's own `codon` command.
 
+LICENSING — confirmed directly against each project's own PyPI/GitHub
+license metadata, not recalled from memory: DNAChisel
+(Edinburgh-Genome-Foundry/DnaChisel) is MIT (Copyright 2017 Edinburgh
+Genome Foundry, University of Edinburgh). python_codon_tables
+(Edinburgh-Genome-Foundry/python_codon_tables, same group) is CC0-1.0 --
+a public-domain dedication, even more permissive than MIT. Neither
+imposes any copyleft or redistribution restriction, so there's no
+conflict with this project's own Apache-2.0 license -- the cleanest
+case of any optional backend (compare af3.py's module docstring, whose
+weights carry real restrictions these don't). Both are pulled in only
+via the "codon" extra (`pip install symbro[codon]`), never vendored.
+
 SCOPE, DELIBERATELY
 ====================
 
@@ -141,6 +153,7 @@ def optimize_sequence(
     avoid_repeats_kmer: Optional[int] = 15,
     avoid_enzymes: Sequence[str] = DEFAULT_ENZYMES_AVOIDED,
     add_stop_codon: bool = True,
+    max_attempts: int = 1,
 ) -> Dict[str, object]:
     """
     Reverse-translates one protein sequence into host-codon-optimized
@@ -181,6 +194,25 @@ def optimize_sequence(
         _best_stop_codon()) after optimization. Set False if this
         sequence is meant to be fused into a larger ORF (e.g. behind an
         N-terminal tag) rather than expressed on its own.
+    max_attempts : DNAChisel's constraint solver has genuine call-to-call
+        randomness (confirmed empirically -- no seed is exposed anywhere
+        in its API, and re-running the exact same input can succeed where
+        a prior attempt didn't). On a hard case -- most notably a protein
+        with near-identical repeated domains, this project's own
+        fused-ring designs' own shape, which fights UniquifyAllKmers --
+        a single attempt can fail a meaningful fraction of the time
+        (confirmed: roughly 1-in-3 on a real repeated-domain design)
+        even though the constraints ARE jointly satisfiable most tries.
+        Default 1 keeps a single attempt, exactly today's behavior --
+        this is deliberately NOT retried automatically, so one call's
+        cost stays predictable unless you ask for more. Pass a higher
+        value (e.g. 3) to retry within this one call instead of having
+        to notice a warning and re-invoke `symbro codon`/this function by
+        hand: keeps the first attempt whose `warnings` comes back empty,
+        or -- only if every attempt still has one -- returns the LAST
+        attempt's best-effort result, with `warnings` noting how many
+        attempts were tried. See `symbro codon --max-attempts` for the
+        CLI equivalent.
 
     Returns {"dna_sequence", "gc_content" (overall, including any
     appended stop codon), "host", "constraints_report" (DNAChisel's own
@@ -191,15 +223,20 @@ def optimize_sequence(
     extremely short or low-complexity protein sequence might not have
     enough synonymous-codon freedom to hit a tight GC window)}.
 
-    Raises ValueError for an unsupported host or a protein_sequence
-    containing non-standard amino acid characters. Raises RuntimeError
-    in the (should-be-impossible, given EnforceTranslation below) case
-    that the final DNA doesn't translate back to the input protein --
-    this is the one thing that must be exactly right for the result to
-    be usable at all, so it's never returned silently wrong.
+    Raises ValueError for an unsupported host, an out-of-range
+    max_attempts, or a protein_sequence containing non-standard amino
+    acid characters. Raises RuntimeError in the (should-be-impossible,
+    given EnforceTranslation below) case that some attempt's DNA doesn't
+    translate back to the input protein -- this is the one thing that
+    must be exactly right for a result to be usable at all, so it's
+    never returned silently wrong, and never retried past either: a
+    translation mismatch is a real bug to report, not a solver hiccup
+    worth re-rolling.
     """
     _require_dnachisel()
     _validate_host(host)
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be >= 1, got {max_attempts!r}.")
 
     cleaned = protein_sequence.strip().upper()
     if not cleaned:
@@ -211,6 +248,48 @@ def optimize_sequence(
             f"{protein_sequence!r}"
         )
 
+    result: Dict[str, object] = {}
+    for attempt in range(1, max_attempts + 1):
+        result = _optimize_once(
+            cleaned, host=host, method=method, gc_min=gc_min, gc_max=gc_max, gc_window=gc_window,
+            homopolymer_max=homopolymer_max, avoid_hairpins=avoid_hairpins,
+            avoid_repeats_kmer=avoid_repeats_kmer, avoid_enzymes=avoid_enzymes,
+            add_stop_codon=add_stop_codon,
+        )
+        if not result["warnings"]:
+            return result
+        if attempt < max_attempts:
+            print(f"    codon-optimization attempt {attempt}/{max_attempts} still had an unresolved "
+                  f"constraint, retrying (DNAChisel's solver has genuine call-to-call randomness)...")
+
+    if max_attempts > 1:
+        result["warnings"] = [
+            f"After {max_attempts} attempts, none fully satisfied every constraint -- "
+            f"returning the last attempt's best-effort result."
+        ] + list(result["warnings"])
+    return result
+
+
+def _optimize_once(
+    cleaned: str,
+    host: str,
+    method: str,
+    gc_min: float,
+    gc_max: float,
+    gc_window: int,
+    homopolymer_max: int,
+    avoid_hairpins: bool,
+    avoid_repeats_kmer: Optional[int],
+    avoid_enzymes: Sequence[str],
+    add_stop_codon: bool,
+) -> Dict[str, object]:
+    """One single reverse-translate-and-optimize attempt against an
+    already-validated, already-uppercased protein sequence -- the body
+    optimize_sequence() used to be, factored out so its max_attempts loop
+    can call it fresh (a genuinely new DNAChisel solver run, not a retry
+    of the same one) more than once. Not meant to be called directly --
+    see optimize_sequence()'s own docstring for the full parameter
+    reference and return shape, which this mirrors exactly."""
     dna = _dc.reverse_translate(cleaned)
 
     constraints: List[object] = [
@@ -239,7 +318,56 @@ def optimize_sequence(
         problem.resolve_constraints()
     except _dc.NoSolutionError as exc:
         warnings.append(f"Could not fully satisfy every constraint: {exc}")
-    problem.optimize()
+    else:
+        # DNAChisel's own precondition, confirmed directly against its
+        # source (ObjectivesMaximizerMixin.optimize_by_exhaustive_search):
+        # "Optimization can only be done when all constraints are
+        # verified" -- calling optimize() after resolve_constraints()
+        # already failed doesn't just skip improving the objective, it
+        # raises ITS OWN NoSolutionError (a different one than the try/
+        # except above catches), previously uncaught here. That silently
+        # turned "one constraint couldn't be fully satisfied" (meant to
+        # surface as a warning on an otherwise-still-returned, best-effort
+        # sequence -- see this function's own docstring) into an
+        # unhandled exception -- which optimize_candidates()'s per-row
+        # try/except then swallowed as a plain "Skipped", silently
+        # dropping the candidate from the batch instead of returning it
+        # flagged. Confirmed reproducible: a protein with near-identical
+        # repeated domains (this project's own fused-ring designs are
+        # exactly this shape) hitting UniquifyAllKmers often fails
+        # resolve_constraints() and previously crashed here every time,
+        # not just warned.
+        constraint_satisfying_sequence = problem.sequence
+        problem.optimize()
+        if not problem.all_constraints_pass():
+            # Confirmed empirically (not assumed from docs, which read as
+            # though optimize() should only ever accept objective-improving
+            # moves that keep every constraint satisfied): on a protein
+            # with near-identical repeated domains, CodonOptimize's
+            # objective-improvement step can push codon choices back
+            # toward a k-mer-repeating pattern that resolve_constraints()
+            # had *just* resolved -- with NO exception raised, and
+            # `warnings` would otherwise stay empty. Trusting an empty
+            # `warnings` list here would silently ship a sequence that
+            # violates its own EnforceGCContent/UniquifyAllKmers/etc, which
+            # is worse than just not codon-optimizing it -- so revert to
+            # the last confirmed constraint-satisfying sequence (from
+            # immediately after resolve_constraints(), before optimize()
+            # touched it) instead of keeping optimize()'s output.
+            # problem.sequence is a plain instance attribute here (not a
+            # property with side effects), and every DNAChisel method used
+            # below/by callers (all_constraints_pass(),
+            # constraints_text_summary(), .sequence itself) re-evaluates
+            # against whatever it currently holds -- confirmed directly by
+            # reproducing this exact failure and checking all three read
+            # correctly post-revert, not assumed.
+            problem.sequence = constraint_satisfying_sequence
+            warnings.append(
+                "CodonOptimize's objective-improvement step produced a sequence that broke a "
+                "constraint DNAChisel had already resolved (caught via all_constraints_pass(), "
+                "since DNAChisel itself raises no exception for this) -- reverted to the last "
+                "constraint-satisfying sequence, which is less codon-optimized as a result."
+            )
 
     final_dna = problem.sequence
     if add_stop_codon:
@@ -271,7 +399,10 @@ def optimize_candidates(df: pd.DataFrame, host: str = DEFAULT_HOST, **kwargs) ->
     pipeline.join_predict_with_pmpnn() produces. kwargs are passed
     straight through to optimize_sequence() (host/method/gc_min/gc_max/
     gc_window/homopolymer_max/avoid_hairpins/avoid_repeats_kmer/
-    avoid_enzymes/add_stop_codon).
+    avoid_enzymes/add_stop_codon/max_attempts -- see that function's own
+    docstring for max_attempts specifically: pass e.g. max_attempts=3 to
+    retry a candidate that hits DNAChisel's genuine solver randomness
+    within this one call, instead of re-invoking `symbro codon` by hand).
 
     A row is skipped (reported, not fatal to the rest of the batch --
     same fail-soft convention as pipeline.run_pmpnn()/run_predict()) if

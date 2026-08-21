@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **pyproject.toml license metadata migrated to PEP 639**: `license = {
+  text = "Apache-2.0" }` plus a separate `"License :: OSI Approved ::
+  Apache Software License"` classifier replaced with the single SPDX
+  license expression `license = "Apache-2.0"`, which current setuptools
+  otherwise deprecates that combination in favor of. Requires
+  `setuptools>=77` as the build-time requirement (bumped from `>=61.0`),
+  since older setuptools can't parse the SPDX string form.
+
 ### Added
+
+- **`codon.py` LICENSING docstring section**: documents DNAChisel (MIT)
+  and python_codon_tables (CC0-1.0), confirmed directly against each
+  project's own PyPI/GitHub metadata -- matching the LICENSING section
+  every other optional-dependency backend module (af3.py, boltz.py,
+  alphafold2.py) already carries. No functional change; both licenses
+  are fully permissive with no conflict against this project's own
+  Apache-2.0.
 
 - **Annotated-symmetry cross-check** (`symbro geometry`, on by default):
   cross-checks each assembly's empirically detected rings against RCSB's
@@ -56,6 +74,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   this first pass: one structure per view, colored by chain; no overlay
   of two structures or symmetry-axis drawing yet.
 
+- **`symbro codon --max-attempts`** (`codon.optimize_sequence()`/
+  `optimize_candidates()`/`run_codon()`): DNAChisel's constraint solver
+  has genuine call-to-call randomness (no seed exposed anywhere in its
+  API) -- on a hard case, most notably a protein with near-identical
+  repeated domains (this project's own fused-ring designs' own shape,
+  which fights the no-repeated-k-mers constraint), a single attempt can
+  fail a meaningful fraction of the time even though the constraints ARE
+  jointly satisfiable most tries -- confirmed on a real HPC-produced
+  candidate at roughly 1-in-3 failure per attempt, resolving within a
+  couple of retries. `--max-attempts N` (default 1, no behavior change
+  unless you opt in) retries within the same command, keeping the first
+  attempt whose `warnings` comes back empty -- turning "notice a
+  flagged row, re-run `symbro codon` by hand, repeat" into one flag.
+  Deliberately not made the default behavior -- every attempt is real
+  solver work, so cost stays predictable unless explicitly requested.
+  Verified against a synthetic repeated-domain protein: `--max-attempts 3`
+  raised the clean-result rate from roughly 65-70% (a single attempt) to
+  95% (19/20) in a real run.
+
 ### Fixed
 
 - **Ring-detection direction/exclusivity bug** (`symbro geometry`, C3/C4/C5
@@ -79,6 +116,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recovers its 4 true C3 trimers (~26-27 A junctions, matching the
   originally reported ~29 A figure) instead of the wrong-direction or
   cross-trimer readings.
+
+- **`completed_partial` treated as terminal with no retry** (every
+  compute-backend `run()` convenience wrapper -- `boltz.py`,
+  `alphafold2.py`, `af3.py`, `pmpnn.py` -- plus `pipeline.run_pmpnn()`'s
+  own independently-written version of the same loop): each of these
+  blocked with `while status["state"] == "running": ...`, which exits
+  immediately the first time `poll_status()` reports *any* non-running
+  state, including `"completed_partial"`. That state is reported both
+  when a job genuinely crashed/was killed after finishing only some
+  outputs (no amount of waiting fixes this) AND when a job finished
+  cleanly (`returncode == 0`, every output really was written) but the
+  polling process's own view of the filesystem hadn't caught up to all
+  of them yet -- two very different situations the old code treated
+  identically, permanently and silently dropping any candidate caught in
+  the second, transient case. Confirmed for real on a live HPC run
+  (4V6B, boltz): 3 of 180 candidates were fully folded and on disk but
+  got excluded from `predict.pkl` with no error or warning, because the
+  one poll that ran landed inside that window -- caught only by manually
+  cross-checking raw output files against the reported result rather
+  than trusting `predict.csv`'s "0 passed."
+  Fixed via a new shared helper, `toolkit/polling.py`'s
+  `wait_for_terminal()`: on seeing `"completed_partial"`, re-polls up to
+  `partial_retries` more times (`partial_retry_interval` seconds apart,
+  defaulting to 3 retries / 5s) before accepting it as final -- a retry
+  that shows more outputs than the last poll keeps going, one that shows
+  the exact same (still-incomplete) count for every retry is accepted as
+  genuinely partial. All five call sites above now go through this one
+  helper instead of their own copy of the loop, matching this project's
+  own precedent of extracting shared polling logic after duplicated
+  copies of it already caused a real bug once (see the SLURM
+  sbatch-polling primitives shared via `selfconsistency.py`).
+  Deliberately NOT applied to RFdiffusion's own multi-row round-robin
+  poller (`pipeline._poll_all_rfdiffusion()`, backing `symbro rfdiffusion`'s
+  blocking wait and `symbro status`) -- its `single_pass=True` mode
+  (`symbro status`) is a deliberate one-shot manual refresh where a human
+  re-invoking the command already acts as the retry; folding automatic
+  partial-retries into it would change that command's own documented
+  "cheap, immediate" contract rather than just fix a bug. Left as a
+  candidate for a follow-up if the same filesystem-lag failure mode is
+  ever confirmed there too.
+
+- **`symbro codon` crashing, and separately silently returning a
+  constraint-violating sequence, on repeated-domain proteins**
+  (`codon.optimize_sequence()`): found while codon-optimizing the first
+  real validated designs from a live HPC run -- this project's own
+  fused-ring output (several near-identical domains joined by diffused
+  linkers into one chain) is exactly the shape that triggers both bugs
+  below, not an edge case.
+  1. `problem.optimize()` (DNAChisel's objective-improvement step) used
+     to run UNCONDITIONALLY, even right after `problem.resolve_constraints()`
+     had already raised `NoSolutionError`. DNAChisel requires every
+     constraint to already be verified before `optimize()` can run
+     (confirmed directly against its source) and raises its OWN
+     `NoSolutionError` otherwise -- a second, previously-uncaught
+     exception that turned a should-be-recoverable "warn and return the
+     best-effort sequence" case (see this module's own docstring) into an
+     unhandled crash, which `optimize_candidates()`'s per-row
+     `try/except` then only surfaced as a plain "Skipped" line --
+     silently dropping the candidate from `codon.pkl`/`codon.fasta`
+     rather than returning it flagged.
+  2. Separately, and worse: DNAChisel's `optimize()` does NOT actually
+     guarantee it preserves constraint satisfaction while improving the
+     `CodonOptimize` objective -- confirmed empirically (not assumed from
+     docs) by reproducing it directly against a synthetic repeated-domain
+     protein: `optimize()` can reintroduce a duplicate-k-mer violation
+     that `resolve_constraints()` had *just* resolved, with no exception
+     raised at all, leaving `warnings` empty (the documented "safe,
+     common case") for a sequence that actually still violates one of
+     its own constraints. Reproduced at roughly a 5-10% rate on a
+     synthetic 4-near-identical-domain test protein.
+  Both fixed together: `optimize()` is now only called once
+  `resolve_constraints()` has actually succeeded, and its result is
+  checked afterward via `problem.all_constraints_pass()` (the real,
+  authoritative check DNAChisel itself exposes) -- if that fails, the
+  sequence is reverted to the last confirmed constraint-satisfying one
+  (from immediately before `optimize()` ran) and a warning is added,
+  rather than either crashing or silently keeping the now-violating
+  "optimized" result. Every `warnings`-populated case was independently
+  re-verified (not just trusting DNAChisel's own report) across a real
+  80-attempt run against the same synthetic repeated-domain protein:
+  zero crashes, zero sequences with an undetected duplicate 15-mer.
 
 ### Documentation
 

@@ -106,6 +106,7 @@ from typing import Dict, List, Optional, Sequence
 import pandas as pd
 
 from toolkit.config import get_tool_config
+from toolkit.polling import wait_for_terminal
 from toolkit.selfconsistency import (
     build_reference_map, collect_results, select_validated_designs,
     slurm_returncode, submit_via_slurm, terminate_or_cancel,
@@ -490,10 +491,12 @@ def run(
     job = prepare_self_consistency_job(selected_df, design_paths, model_dir=model_dir, **job_kwargs)
     run_handle = submit(job, backend=backend, config=config, terms_acknowledged=True)
 
-    status = poll_status(run_handle)
-    while status["state"] == "running":
-        time.sleep(poll_interval)
-        status = poll_status(run_handle)
+    # wait_for_terminal() (toolkit/polling.py) does what a bare
+    # `while status["state"] == "running": ...` loop used to do here, PLUS
+    # re-checks a "completed_partial" state a few times before trusting it
+    # -- see that module's own docstring for the real, confirmed
+    # filesystem-visibility-lag failure mode this closes.
+    status = wait_for_terminal(lambda: poll_status(run_handle), poll_interval=poll_interval)
 
     if status["state"] == "failed":
         raise RuntimeError(

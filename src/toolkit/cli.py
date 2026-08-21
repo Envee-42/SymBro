@@ -739,6 +739,14 @@ def codon(
         help="Append the host's own preferred stop codon. Use --no-stop-codon if this sequence is meant "
              "to be fused into a larger ORF (e.g. behind an N-terminal tag)."
     ),
+    max_attempts: int = typer.Option(
+        1, "--max-attempts", help="Retry a candidate up to this many times if DNAChisel's solver -- which has "
+             "genuine call-to-call randomness -- doesn't fully satisfy every constraint on the first try "
+             "(common on a protein with near-identical repeated domains, e.g. a fused symmetric-ring design; "
+             "usually resolves within a couple of attempts). Default 1: no automatic retry, same as before "
+             "this flag existed -- a flagged row still gets returned either way, this just saves you from "
+             "re-running the whole command by hand when a retry would likely fix it."
+    ),
     fasta_path: Optional[str] = typer.Option(
         None, "--fasta", help="Where to write the orderable FASTA (default: <state-dir>/codon.fasta)."
     ),
@@ -755,7 +763,8 @@ def codon(
             assembly_id=assembly_id, host=host, method=method, gc_min=gc_min, gc_max=gc_max,
             gc_window=gc_window, homopolymer_max=homopolymer_max, avoid_hairpins=avoid_hairpins,
             avoid_repeats_kmer=avoid_repeats_kmer or None, avoid_enzymes=avoid_enzyme or None,
-            add_stop_codon=add_stop_codon, fasta_path=fasta_path, state_dir=ctx.obj["state_dir"],
+            add_stop_codon=add_stop_codon, max_attempts=max_attempts, fasta_path=fasta_path,
+            state_dir=ctx.obj["state_dir"],
         )
     except pipeline.StageNotFoundError as exc:
         _fail(str(exc))
